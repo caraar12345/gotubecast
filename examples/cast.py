@@ -10,6 +10,11 @@ Requirements:
     apt install mpv
     pip install yt-dlp          # or: apt install yt-dlp
 
+Touch controls (provided by mpv-touch.lua, auto-loaded from the same directory):
+    Tap anywhere   → reveal control bar
+    [Vol−] [Play/Pause] [Vol+] [✕ Stop]  — bottom quarter of the screen
+    Two-finger swipe / scroll             → volume up/down (always active)
+
 Configuration (environment variables):
     SCREEN_NAME     Friendly name shown in the YouTube app   (default: GoTubeCast Pi)
     SCREEN_APP      App identifier                           (default: gotubecast-pi-v1)
@@ -18,6 +23,7 @@ Configuration (environment variables):
     SUB_LANG        Subtitle language code, e.g. "en"        (default: en, blank to disable)
     VIDEO_QUALITY   Maximum video height in pixels           (default: 1080)
     MPV_OPTS        Extra mpv CLI options (space-separated)
+                    e.g. MPV_OPTS=--fullscreen for a dedicated display
 
 Usage:
     python3 cast.py
@@ -46,6 +52,8 @@ MPV_EXTRA     = os.environ.get("MPV_OPTS",      "").split()
 
 MPV_SOCKET = "/tmp/gotubecast-mpv.sock"
 TEMP_DIR   = Path(tempfile.gettempdir()) / "gotubecast"
+SCRIPT_DIR = Path(__file__).parent
+MPV_TOUCH  = SCRIPT_DIR / "mpv-touch.lua"
 
 # ---------------------------------------------------------------------------
 # State
@@ -188,7 +196,11 @@ def play_video(video_id: str) -> None:
         "--force-window=yes",
         "--keep-open=no",
         "--really-quiet",
-    ] + MPV_EXTRA
+        "--no-osc",                        # replaced by mpv-touch.lua
+    ]
+    if MPV_TOUCH.exists():
+        cmd.append(f"--script={MPV_TOUCH}")
+    cmd += MPV_EXTRA
 
     for sub in sub_result:
         cmd.append(f"--sub-file={sub}")
