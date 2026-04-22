@@ -89,7 +89,6 @@ func main() {
 		resp, err := http.Get("https://www.youtube.com/api/lounge/pairing/generate_screen_id")
 		if err != nil {
 			panic(err)
-			return
 		}
 		defer resp.Body.Close()
 		body, err := ioutil.ReadAll(resp.Body)
@@ -116,6 +115,7 @@ func main() {
 		panic(err)
 	}
 	tokenScreenItem := tokenObj.Screens[0]
+	currentLoungeToken = tokenScreenItem.LoungeToken
 	msgPrintln(fmt.Sprint("lounge_token ", tokenScreenItem.LoungeToken, " ", tokenScreenItem.Expiration/1000))
 
 	bindVals = url.Values{
@@ -142,6 +142,9 @@ func main() {
 	}
 	defer resp.Body.Close()
 	decodeBindStream(resp.Body)
+
+	// DIAL server (device discovery + YouTube app endpoint):
+	startDIAL()
 
 	// pairing code every 5 minutes:
 	go func() {
@@ -236,7 +239,6 @@ func decodeBindStream(r io.Reader) (err error) {
 			dec.Token()
 		}
 	}
-	return
 }
 
 // genericCmd interpretes and executes commands from the bind stream
@@ -402,6 +404,15 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 	case "stopVideo":
 		msgPrintln("stop")
 		postBind("nowPlaying", map[string]string{})
+	case "setSubtitlesTrack":
+		data := paramsList[0].(map[string]interface{})
+		langCode, _ := data["languageCode"].(string)
+		videoId, _ := data["videoId"].(string)
+		if langCode == "" {
+			msgPrintln("set_subtitles off")
+		} else {
+			msgPrintln(fmt.Sprintf("set_subtitles %s %s", videoId, langCode))
+		}
 	case "onUserActivity":
 		msgPrintln("user_action")
 	case "next":
