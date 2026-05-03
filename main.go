@@ -7,6 +7,7 @@ package main
 // keep player state, devices etc.
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -61,7 +63,7 @@ var (
 	bindVals        url.Values
 	currentVolume   string = "100"
 	currentMuted    bool   = false
-	ofs             uint64 = 0
+	ofs             uint64 // lounge bind sequence; updated with atomic.AddUint64
 	playState       string = "3"
 	ctt             string
 	//playTimer     *time.Timer
@@ -78,6 +80,8 @@ var (
 	curIndex      int
 	curListVideos []Video
 	printLock     sync.Mutex
+	playbackMu    sync.Mutex
+	postBindMu    sync.Mutex
 )
 
 func init() {
@@ -92,6 +96,7 @@ func init() {
 
 func main() {
 	flag.Parse()
+	go readStdinPlayback()
 	if err := initOutboundHTTP(debugRootCAPath); err != nil {
 		panic(err)
 	}
@@ -206,7 +211,7 @@ func main() {
 			msgPrintln(fmt.Sprintf("error reached %d errors, terminating...", errCount))
 			return
 		}
-		ofs++
+		atomic.AddUint64(&ofs, 1)
 		// Must clone: bindVals is a map; `bindValsGet := bindVals` aliases the same map,
 		// so assigning RID/CI would corrupt long-lived POST state (CI leaked onto every
 		// postBind URL and broke remote/playlist delivery).
@@ -268,6 +273,87 @@ func decodeBindStream(r io.Reader) (err error) {
 			// closing ]:
 			dec.Token()
 		}
+	}
+}
+
+func postBindOnStateChangeLocked() {
+	postBind("onStateChange", map[string]string{
+		"currentTime": fmt.Sprintf("%.3f", curTime.Seconds()),
+		"state":       playState,
+		"duration":    strconv.Itoa(curVideo.Length),
+		"cpn":         "foo",
+	})
+}
+
+// loungeEmitAt applies playback position/state from the local player (stdin: playback_notify).
+func loungeEmitAt(state string, posSec float64) {
+	if state != "1" && state != "2" {
+		return
+	}
+	playbackMu.Lock()
+	defer playbackMu.Unlock()
+	playState = state
+	curTime = time.Duration(posSec * float64(time.Second))
+	if state == "1" {
+		startTime = time.Now().Add(-curTime)
+	}
+	postBindOnStateChangeLocked()
+	dbgPrintln(fmt.Sprintf("stdin playback_notify state=%s time=%.3f", state, posSec))
+}
+
+// applySetPlaylistPlaybackState mirrors mobile playbackState into the Lounge bind stream.
+// YouTube iOS often sends play/pause only via setPlaylist, not discrete play/pause RPCs.
+func applySetPlaylistPlaybackState(playbackState, currentTimeStr string, notifyPlayer bool) {
+	ps := strings.ToUpper(strings.TrimSpace(playbackState))
+	if ps != "PLAYING" && ps != "PAUSED" {
+		return
+	}
+	playbackMu.Lock()
+	if currentTimeStr != "" {
+		if d, err := time.ParseDuration(currentTimeStr + "s"); err == nil {
+			curTime = d
+		}
+	} else if playState == "1" {
+		curTime = time.Since(startTime)
+	}
+	if ps == "PLAYING" {
+		playState = "1"
+		startTime = time.Now().Add(-curTime)
+	} else {
+		playState = "2"
+	}
+	postBindOnStateChangeLocked()
+	playbackMu.Unlock()
+
+	if notifyPlayer {
+		if ps == "PLAYING" {
+			msgPrintln("play")
+		} else {
+			msgPrintln("pause")
+		}
+	}
+}
+
+func readStdinPlayback() {
+	sc := bufio.NewScanner(os.Stdin)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 3 || fields[0] != "playback_notify" {
+			continue
+		}
+		st := fields[1]
+		if st != "1" && st != "2" {
+			continue
+		}
+		posSec, err := strconv.ParseFloat(fields[2], 64)
+		if err != nil || posSec < 0 {
+			continue
+		}
+		loungeEmitAt(st, posSec)
 	}
 }
 
@@ -358,6 +444,9 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		if curVideoId != "" {
 			msgPrintln(fmt.Sprint("video_id ", curVideoId))
 		}
+		if ps := getMapString(data, "playbackState"); ps != "" {
+			applySetPlaylistPlaybackState(ps, getMapString(data, "currentTime"), true)
+		}
 	case "addVideo":
 		data := paramsList[0].(map[string]interface{})
 		videoId, _ := data["videoId"].(string)
@@ -421,24 +510,18 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 	*/
 	case "play":
 		msgPrintln("play")
+		playbackMu.Lock()
 		playState = "1"
 		startTime = time.Now().Add(-curTime)
-		postBind("onStateChange", map[string]string{
-			"currentTime": fmt.Sprintf("%.3f", curTime.Seconds()),
-			"state":       "1",
-			"duration":    strconv.Itoa(curVideo.Length),
-			"cpn":         "foo",
-		})
+		postBindOnStateChangeLocked()
+		playbackMu.Unlock()
 	case "pause":
 		msgPrintln("pause")
+		playbackMu.Lock()
 		playState = "2"
 		curTime = time.Since(startTime)
-		postBind("onStateChange", map[string]string{
-			"currentTime": fmt.Sprintf("%.3f", curTime.Seconds()),
-			"state":       "2",
-			"duration":    strconv.Itoa(curVideo.Length),
-			"cpn":         "foo",
-		})
+		postBindOnStateChangeLocked()
+		playbackMu.Unlock()
 	case "getVolume":
 		postBind("onVolumeChanged", map[string]string{"volume": currentVolume, "muted": strconv.FormatBool(currentMuted)})
 	case "setVolume":
@@ -464,15 +547,11 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		if err != nil {
 			currentTimeDuration = 0
 		}
+		playbackMu.Lock()
 		curTime = currentTimeDuration
 		startTime = time.Now().Add(-curTime)
-
-		postBind("onStateChange", map[string]string{
-			"currentTime": newTime,
-			"state":       playState,
-			"duration":    strconv.Itoa(curVideo.Length),
-			"cpn":         "foo",
-		})
+		postBindOnStateChangeLocked()
+		playbackMu.Unlock()
 	case "stopVideo":
 		dialStateMu.Lock()
 		curVideoId = ""
@@ -633,8 +712,10 @@ func getMapString(data map[string]interface{}, key string) string {
 }
 
 func postBind(sc string, params map[string]string) {
-	ofs++
-	postVals := url.Values{"count": {"1"}, "ofs": {fmt.Sprintf("%v", ofs)}}
+	postBindMu.Lock()
+	defer postBindMu.Unlock()
+	nextOfs := atomic.AddUint64(&ofs, 1)
+	postVals := url.Values{"count": {"1"}, "ofs": {fmt.Sprintf("%v", nextOfs)}}
 	postVals["req0__sc"] = []string{sc}
 	for k, v := range params {
 		postVals["req0_"+k] = []string{v}

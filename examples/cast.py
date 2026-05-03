@@ -41,6 +41,7 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -95,6 +96,70 @@ def mpv_ipc(cmd: dict) -> None:
         s.close()
     except OSError:
         pass
+
+
+def mpv_get_property(name: str):
+    """Read one mpv property via the IPC socket (request/response)."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(MPV_SOCKET)
+        s.sendall((json.dumps({"command": ["get_property", name]}) + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(8192)
+            if not chunk:
+                break
+            buf += chunk
+        s.close()
+        if b"\n" not in buf:
+            return None
+        line = buf.split(b"\n", 1)[0]
+        resp = json.loads(line.decode())
+        if resp.get("error") != "success":
+            return None
+        return resp.get("data")
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _playback_observer(gtc: subprocess.Popen) -> None:
+    """Push mpv pause/time-pos to gotubecast stdin so the Lounge client UI stays in sync."""
+    last_pause: bool | None = None
+    last_play_generation = 0
+    while gtc.poll() is None:
+        time.sleep(0.25)
+        with _mpv_lock:
+            gen = _play_generation
+            alive = _mpv_proc is not None and _mpv_proc.poll() is None
+        if gen != last_play_generation:
+            last_play_generation = gen
+            last_pause = None
+        if not alive:
+            last_pause = None
+            continue
+        if not Path(MPV_SOCKET).exists():
+            continue
+        pause_raw = mpv_get_property("pause")
+        if pause_raw is None:
+            continue
+        paused = bool(pause_raw)
+        if last_pause is not None and paused == last_pause:
+            continue
+        last_pause = paused
+        t_raw = mpv_get_property("time-pos")
+        try:
+            pos = float(t_raw) if t_raw is not None else 0.0
+        except (TypeError, ValueError):
+            pos = 0.0
+        st = "2" if paused else "1"
+        line = f"playback_notify {st} {pos:.3f}\n"
+        try:
+            if gtc.stdin and not gtc.stdin.closed:
+                gtc.stdin.write(line)
+                gtc.stdin.flush()
+        except (BrokenPipeError, OSError, TypeError, ValueError):
+            return
 
 # ---------------------------------------------------------------------------
 # yt-dlp helpers
@@ -381,11 +446,14 @@ def main() -> None:
 
     proc = subprocess.Popen(
         gtc_cmd,
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
     )
+
+    threading.Thread(target=_playback_observer, args=(proc,), daemon=True).start()
 
     try:
         for line in proc.stdout:
