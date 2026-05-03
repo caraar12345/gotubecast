@@ -150,6 +150,7 @@ fi
 
 else
     echo ">>> Update mode: skipping packages and mpv/uosc setup; rebuilding gotubecast + refreshing install paths only."
+    git pull -c "${REPO_DIR}"
 fi
 
 # ── gotubecast binary ─────────────────────────────────────────────────────────
