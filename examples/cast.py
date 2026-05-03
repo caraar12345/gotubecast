@@ -11,11 +11,11 @@ Requirements:
     go build .               # build gotubecast binary and put it on PATH
 
 Touch controls (installed by setup.sh — uosc + mpv-touch-gestures):
-    Tap            → pause/unpause
-    Swipe left/right     → seek
+    Tap                        → pause/unpause
+    Swipe left/right           → seek
     Swipe up/down (right half) → volume
-    Long-press     → uosc context menu (subtitle/audio track, quality, etc.)
-    ✕ button in controls bar → quit mpv
+    Long-press                 → uosc context menu (subtitle/audio track, quality…)
+    ✕ button in controls bar   → quit mpv
 
 Configuration (environment variables):
     SCREEN_NAME     Friendly name shown in the YouTube app   (default: GoTubeCast Pi)
@@ -51,8 +51,16 @@ SUB_LANG      = os.environ.get("SUB_LANG",      "en")
 VIDEO_QUALITY = os.environ.get("VIDEO_QUALITY", "1080")
 MPV_EXTRA     = os.environ.get("MPV_OPTS",      "").split()
 
-MPV_SOCKET = "/tmp/gotubecast-mpv.sock"
-TEMP_DIR   = Path(tempfile.gettempdir()) / "gotubecast"
+# Use XDG_RUNTIME_DIR when available (OS-managed, 0700); otherwise create a
+# private temp directory so the socket and subtitle files are not world-readable.
+_xdg = os.environ.get("XDG_RUNTIME_DIR")
+RUNTIME_DIR = Path(_xdg) / "gotubecast" if _xdg else Path(
+    tempfile.mkdtemp(prefix="gotubecast-")
+)
+RUNTIME_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+MPV_SOCKET = str(RUNTIME_DIR / "mpv.sock")
+TEMP_DIR   = RUNTIME_DIR / "downloads"
 
 # ---------------------------------------------------------------------------
 # State
@@ -60,6 +68,8 @@ TEMP_DIR   = Path(tempfile.gettempdir()) / "gotubecast"
 
 _mpv_proc = None
 _mpv_lock = threading.Lock()
+_play_generation     = 0   # incremented on each play_video(); guards stale fetches
+_subtitle_generation = 0   # incremented on each subtitle change; guards stale loads
 
 # ---------------------------------------------------------------------------
 # mpv IPC
@@ -117,8 +127,20 @@ def fetch_subtitles(video_id: str, lang: str) -> Path | None:
         return None
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     out_tmpl = str(TEMP_DIR / video_id)
+
+    # Remove stale files for this language before downloading so we can't
+    # accidentally return a leftover track from a previous request.
+    for stale in [
+        *TEMP_DIR.glob(f"{video_id}.{lang}*.srt"),
+        *TEMP_DIR.glob(f"{video_id}.{lang}*.vtt"),
+    ]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["yt-dlp",
              "--write-subs", "--write-auto-subs",
              "--sub-lang", lang,
@@ -132,9 +154,11 @@ def fetch_subtitles(video_id: str, lang: str) -> Path | None:
         )
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return None
+    if result.returncode != 0:
+        return None
     candidates = (
-        sorted(TEMP_DIR.glob(f"{video_id}.*.srt")) +
-        sorted(TEMP_DIR.glob(f"{video_id}.*.vtt"))
+        sorted(TEMP_DIR.glob(f"{video_id}.{lang}*.srt")) +
+        sorted(TEMP_DIR.glob(f"{video_id}.{lang}*.vtt"))
     )
     return candidates[0] if candidates else None
 
@@ -142,17 +166,25 @@ def fetch_subtitles(video_id: str, lang: str) -> Path | None:
 # Playback control
 # ---------------------------------------------------------------------------
 
-def play_video(video_id: str) -> None:
+def _reap_mpv() -> None:
+    """Terminate and wait for the current mpv process. Caller must hold _mpv_lock."""
     global _mpv_proc
-    # Stop current player under the lock, then do the slow work outside it.
+    if _mpv_proc and _mpv_proc.poll() is None:
+        _mpv_proc.terminate()
+        try:
+            _mpv_proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            _mpv_proc.kill()
+            _mpv_proc.wait()
+        _mpv_proc = None
+
+
+def play_video(video_id: str) -> None:
+    global _mpv_proc, _play_generation
     with _mpv_lock:
-        if _mpv_proc and _mpv_proc.poll() is None:
-            _mpv_proc.terminate()
-            try:
-                _mpv_proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                _mpv_proc.kill()
-            _mpv_proc = None
+        _play_generation += 1
+        generation = _play_generation
+        _reap_mpv()
 
         TEMP_DIR.mkdir(parents=True, exist_ok=True)
         for f in TEMP_DIR.glob(f"{video_id}.*"):
@@ -165,7 +197,7 @@ def play_video(video_id: str) -> None:
         except OSError:
             pass
 
-    # Fetch stream URL and subtitles concurrently.
+    # Fetch stream URL and subtitles concurrently (lock released during I/O).
     url_result: list = []
     sub_result: list = []
 
@@ -196,7 +228,8 @@ def play_video(video_id: str) -> None:
         "--keep-open=no",
         "--really-quiet",
         "--no-osc",                        # replaced by uosc (installed by setup.sh)
-    ] + MPV_EXTRA
+        *MPV_EXTRA,
+    ]
 
     for sub in sub_result:
         cmd.append(f"--sub-file={sub}")
@@ -207,16 +240,23 @@ def play_video(video_id: str) -> None:
         cmd.append(f"--audio-file={url_result[1]}")
 
     with _mpv_lock:
+        # Abort if a newer play_video() call has already taken over.
+        if generation != _play_generation:
+            return
         _mpv_proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
 
 
-def load_subtitle_track(video_id: str, lang: str) -> None:
+def load_subtitle_track(video_id: str, lang: str, generation: int) -> None:
     """Download a subtitle track and sideload it into the running mpv instance."""
     if not lang:
         mpv_ipc({"command": ["set_property", "sid", "no"]})
         return
     sub = fetch_subtitles(video_id, lang)
     if sub:
+        with _mpv_lock:
+            # Abort if a newer subtitle selection has superseded this one.
+            if generation != _subtitle_generation:
+                return
         mpv_ipc({"command": ["sub-add", str(sub), "select"]})
 
 # ---------------------------------------------------------------------------
@@ -224,6 +264,8 @@ def load_subtitle_track(video_id: str, lang: str) -> None:
 # ---------------------------------------------------------------------------
 
 def dispatch(line: str) -> None:
+    global _subtitle_generation
+
     parts = line.split()
     if not parts:
         return
@@ -251,8 +293,7 @@ def dispatch(line: str) -> None:
 
     elif cmd == "stop":
         with _mpv_lock:
-            if _mpv_proc and _mpv_proc.poll() is None:
-                _mpv_proc.terminate()
+            _reap_mpv()
 
     elif cmd == "seek_to":
         try:
@@ -271,10 +312,15 @@ def dispatch(line: str) -> None:
         # "set_subtitles off"            → disable
         # "set_subtitles <id> <lang>"    → load track
         if len(parts) >= 3 and parts[1] != "off":
+            with _mpv_lock:
+                _subtitle_generation += 1
+                gen = _subtitle_generation
             threading.Thread(
-                target=load_subtitle_track, args=(parts[1], parts[2]), daemon=True
+                target=load_subtitle_track, args=(parts[1], parts[2], gen), daemon=True
             ).start()
         else:
+            with _mpv_lock:
+                _subtitle_generation += 1
             mpv_ipc({"command": ["set_property", "sid", "no"]})
 
     elif cmd == "remote_join":
@@ -325,8 +371,7 @@ def main() -> None:
         except subprocess.TimeoutExpired:
             proc.kill()
         with _mpv_lock:
-            if _mpv_proc and _mpv_proc.poll() is None:
-                _mpv_proc.terminate()
+            _reap_mpv()
 
 
 if __name__ == "__main__":

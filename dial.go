@@ -1,11 +1,14 @@
 package main
 
 import (
+	"encoding/xml"
 	"flag"
 	"fmt"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 )
 
 const (
@@ -18,10 +21,21 @@ var (
 	dialHTTPPort       int
 	currentLoungeToken string
 	dialLocalIP        string
+
+	// dialStateMu guards curVideoId reads in HTTP handler goroutines against
+	// concurrent writes from the Lounge command loop in main.go.
+	dialStateMu sync.RWMutex
 )
 
 func init() {
 	flag.IntVar(&dialHTTPPort, "p", 8008, "DIAL server HTTP port (0 to disable)")
+}
+
+// xmlEsc returns s with XML special characters escaped.
+func xmlEsc(s string) string {
+	var b strings.Builder
+	xml.EscapeText(&b, []byte(s))
+	return b.String()
 }
 
 // startDIAL starts the DIAL HTTP server and SSDP multicast listener.
@@ -40,7 +54,12 @@ func startDIAL() {
 	mux.HandleFunc("/apps/", handleApps)
 
 	go func() {
-		if err := http.ListenAndServe(fmt.Sprintf(":%d", dialHTTPPort), mux); err != nil {
+		srv := &http.Server{
+			Addr:              fmt.Sprintf(":%d", dialHTTPPort),
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		if err := srv.ListenAndServe(); err != nil {
 			msgPrintln(fmt.Sprintf("error DIAL HTTP: %v", err))
 		}
 	}()
@@ -61,16 +80,19 @@ func handleDIALDesc(w http.ResponseWriter, r *http.Request) {
     <modelName>GoTubeCast</modelName>
     <UDN>uuid:%s</UDN>
   </device>
-</root>`, screenName, screenUid)
+</root>`, xmlEsc(screenName), xmlEsc(screenUid))
 }
 
 func handleYouTubeApp(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		dialStateMu.RLock()
 		state := "stopped"
 		if curVideoId != "" {
 			state = "running"
 		}
+		dialStateMu.RUnlock()
+
 		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 		w.Header().Set("Access-Control-Allow-Origin", "https://www.youtube.com")
 		fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
@@ -85,7 +107,7 @@ func handleYouTubeApp(w http.ResponseWriter, r *http.Request) {
     <deviceId>%s</deviceId>
     <deviceName>%s</deviceName>
   </additionalData>
-</service>`, state, screenId, currentLoungeToken, screenUid, screenName)
+</service>`, state, xmlEsc(screenId), xmlEsc(currentLoungeToken), xmlEsc(screenUid), xmlEsc(screenName))
 	case http.MethodPost:
 		w.Header().Set("Location", fmt.Sprintf("http://%s:%d/apps/YouTube/run", dialLocalIP, dialHTTPPort))
 		w.WriteHeader(http.StatusCreated)
@@ -144,7 +166,11 @@ func runSSDPListener() {
 			continue
 		}
 		if isSSDPSearch(string(buf[:n])) {
-			go sendSSDPResponse(from)
+			// Reply from the listening socket so the source port is 1900,
+			// which some DIAL clients require.
+			if err := sendSSDPResponse(conn, from); err != nil {
+				dbgPrintln(fmt.Sprintf("error SSDP response: %v", err))
+			}
 		}
 	}
 }
@@ -154,7 +180,7 @@ func isSSDPSearch(msg string) bool {
 		(strings.Contains(msg, dialSvcType) || strings.Contains(msg, "ssdp:all"))
 }
 
-func sendSSDPResponse(to *net.UDPAddr) {
+func sendSSDPResponse(conn *net.UDPConn, to *net.UDPAddr) error {
 	resp := fmt.Sprintf(
 		"HTTP/1.1 200 OK\r\n"+
 			"CACHE-CONTROL: max-age=1800\r\n"+
@@ -169,20 +195,34 @@ func sendSSDPResponse(to *net.UDPAddr) {
 		screenUid, dialSvcType,
 		dialLocalIP, dialHTTPPort,
 	)
-	conn, err := net.DialUDP("udp4", nil, to)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	conn.Write([]byte(resp))
+	_, err := conn.WriteToUDP([]byte(resp), to)
+	return err
 }
 
-// getOutboundIP returns the host's preferred outbound IP by probing a UDP connection.
+// getOutboundIP returns the first non-loopback IPv4 address found on an active
+// interface. Falls back to 127.0.0.1 if none is found.
 func getOutboundIP() string {
-	conn, err := net.Dial("udp4", "8.8.8.8:80")
+	ifaces, err := net.Interfaces()
 	if err != nil {
 		return "127.0.0.1"
 	}
-	defer conn.Close()
-	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			if ip := ipNet.IP.To4(); ip != nil {
+				return ip.String()
+			}
+		}
+	}
+	return "127.0.0.1"
 }

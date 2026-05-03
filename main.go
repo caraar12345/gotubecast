@@ -286,7 +286,9 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		}
 	case "setPlaylist":
 		data := paramsList[0].(map[string]interface{})
+		dialStateMu.Lock()
 		curVideoId = data["videoId"].(string)
+		dialStateMu.Unlock()
 		/*
 		curListId = data["listId"].(string)
 		info := getListInfo(curListId)
@@ -408,10 +410,15 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		data := paramsList[0].(map[string]interface{})
 		langCode, _ := data["languageCode"].(string)
 		videoId, _ := data["videoId"].(string)
+		if videoId == "" {
+			videoId = curVideoId
+		}
 		if langCode == "" {
 			msgPrintln("set_subtitles off")
-		} else {
+		} else if videoId != "" {
 			msgPrintln(fmt.Sprintf("set_subtitles %s %s", videoId, langCode))
+		} else {
+			dbgPrintln("skipping subtitle track change: no video id")
 		}
 	case "onUserActivity":
 		msgPrintln("user_action")
@@ -421,7 +428,9 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 			curIndex++
 			curTime = 0
 			startTime = time.Now()
+			dialStateMu.Lock()
 			curVideoId = curList[curIndex]
+			dialStateMu.Unlock()
 			curVideo = curListVideos[curIndex]
 			msgPrintln(fmt.Sprint("video_id ", curVideoId))
 			postBind("nowPlaying", map[string]string{
@@ -445,7 +454,9 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 			curIndex--
 			curTime = 0
 			startTime = time.Now()
+			dialStateMu.Lock()
 			curVideoId = curList[curIndex]
+			dialStateMu.Unlock()
 			curVideo = curListVideos[curIndex]
 			msgPrintln(fmt.Sprint("video_id ", curVideoId))
 			postBind("nowPlaying", map[string]string{
