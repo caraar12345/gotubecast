@@ -5,12 +5,16 @@
 #   • mpv, yt-dlp, python3, curl (via apt)
 #   • uosc        — feature-rich mpv UI  (https://github.com/tomasklaen/uosc)
 #   • pointer-event + touch-gestures     (https://github.com/christoph-heinrich)
+#   • gotubecast binary → ~/.local/bin/gotubecast  (built from source via go)
+#   • cast.py          → ~/.local/lib/gotubecast/cast.py
+#   • systemd user service gotubecast-cast (enabled, not started)
 #
 # Creates configs under ~/.config/mpv/ tuned for a touchscreen Pi display.
 # Safe to re-run: scripts are overwritten, mpv.conf is patched not replaced.
 
 set -euo pipefail
 
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MPV_CFG="${HOME}/.config/mpv"
 SCRIPTS="${MPV_CFG}/scripts"
 OPTS="${MPV_CFG}/script-opts"
@@ -125,6 +129,35 @@ if ! grep -qF "${INCLUDE_LINE}" "${MPV_CONF}" 2>/dev/null; then
     echo "${INCLUDE_LINE}" >> "${MPV_CONF}"
 fi
 
+# ── gotubecast binary ─────────────────────────────────────────────────────────
+
+echo ">>> Building gotubecast..."
+mkdir -p "${HOME}/.local/bin"
+if command -v go &>/dev/null; then
+    go build -C "${REPO_DIR}" -o "${HOME}/.local/bin/gotubecast" .
+    echo "    Installed to ~/.local/bin/gotubecast"
+else
+    echo "    WARNING: go not found — skipping build. Install Go then run:"
+    echo "    go build -C ${REPO_DIR} -o ~/.local/bin/gotubecast ."
+fi
+
+# ── cast.py ───────────────────────────────────────────────────────────────────
+
+echo ">>> Installing cast.py..."
+CAST_INSTALL="${HOME}/.local/lib/gotubecast"
+mkdir -p "${CAST_INSTALL}"
+cp "${REPO_DIR}/examples/cast.py" "${CAST_INSTALL}/cast.py"
+
+# ── systemd user service ──────────────────────────────────────────────────────
+
+echo ">>> Installing systemd user service..."
+SYSTEMD_USER="${HOME}/.config/systemd/user"
+mkdir -p "${SYSTEMD_USER}"
+cp "${REPO_DIR}/examples/gotubecast-cast.service" "${SYSTEMD_USER}/gotubecast-cast.service"
+systemctl --user daemon-reload
+systemctl --user enable gotubecast-cast
+echo "    Enabled gotubecast-cast (not started — see note below)."
+
 # ── done ─────────────────────────────────────────────────────────────────────
 
 echo ""
@@ -135,7 +168,11 @@ echo "  Swipe up/down (right half) → volume"
 echo "  Long-press       → uosc context menu"
 echo "  ✕ in controls bar → quit mpv"
 echo ""
-echo "To start casting:"
-echo "  python3 examples/cast.py"
+echo "Service management:"
+echo "  Start now:   systemctl --user start gotubecast-cast"
+echo "  View logs:   journalctl --user -u gotubecast-cast -f"
+echo "  Customise:   edit ~/.config/gotubecast/env  (SCREEN_NAME, MPV_OPTS, …)"
 echo ""
-echo "For a fullscreen dedicated display add MPV_OPTS=--fullscreen before the command."
+echo "For a fullscreen dedicated display:"
+echo "  echo 'MPV_OPTS=--fullscreen' >> ~/.config/gotubecast/env"
+echo "  systemctl --user restart gotubecast-cast"
