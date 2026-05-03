@@ -11,14 +11,33 @@
 #
 # Creates configs under ~/.config/mpv/ tuned for a touchscreen Pi display.
 # Safe to re-run: scripts are overwritten, mpv.conf is patched not replaced.
+#
+# Update in place (skip apt / mpv / uosc — only rebuild + copy artifacts):
+#   bash examples/setup.sh --update
+#   bash examples/setup.sh -u
+#   bash examples/setup.sh update
 
 set -euo pipefail
+
+UPDATE_ONLY=0
+for arg in "$@"; do
+    case "${arg}" in
+        --update|-u|update) UPDATE_ONLY=1 ;;
+        -h|--help)
+            echo "Usage: $(basename "$0") [--update|-u]"
+            echo "  (no args)  Full install: packages, mpv UI, gotubecast, cast.py, systemd unit."
+            echo "  --update   Rebuild gotubecast, reinstall cast.py + service unit, daemon-reload only."
+            exit 0
+            ;;
+    esac
+done
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MPV_CFG="${HOME}/.config/mpv"
 SCRIPTS="${MPV_CFG}/scripts"
 OPTS="${MPV_CFG}/script-opts"
 
+if [[ "${UPDATE_ONLY}" -eq 0 ]]; then
 # ── system packages ──────────────────────────────────────────────────────────
 
 echo ">>> Installing packages..."
@@ -129,6 +148,10 @@ if ! grep -qF "${INCLUDE_LINE}" "${MPV_CONF}" 2>/dev/null; then
     echo "${INCLUDE_LINE}" >> "${MPV_CONF}"
 fi
 
+else
+    echo ">>> Update mode: skipping packages and mpv/uosc setup; rebuilding gotubecast + refreshing install paths only."
+fi
+
 # ── gotubecast binary ─────────────────────────────────────────────────────────
 
 echo ">>> Building gotubecast..."
@@ -155,24 +178,35 @@ SYSTEMD_USER="${HOME}/.config/systemd/user"
 mkdir -p "${SYSTEMD_USER}"
 cp "${REPO_DIR}/examples/gotubecast-cast.service" "${SYSTEMD_USER}/gotubecast-cast.service"
 systemctl --user daemon-reload
-systemctl --user enable gotubecast-cast
-echo "    Enabled gotubecast-cast (not started — see note below)."
+if [[ "${UPDATE_ONLY}" -eq 0 ]]; then
+    systemctl --user enable gotubecast-cast
+    echo "    Enabled gotubecast-cast (not started — see note below)."
+else
+    echo "    Refreshed gotubecast-cast.service (run: systemctl --user daemon-reload already done)."
+fi
 
 # ── done ─────────────────────────────────────────────────────────────────────
 
 echo ""
-echo "Done!  Gesture summary:"
-echo "  Tap              → pause / unpause"
-echo "  Swipe left/right → seek (or previous/next video)"
-echo "  Swipe up/down (right half) → volume"
-echo "  Long-press       → uosc context menu"
-echo "  ✕ in controls bar → quit mpv"
-echo ""
-echo "Service management:"
-echo "  Start now:   systemctl --user start gotubecast-cast"
-echo "  View logs:   journalctl --user -u gotubecast-cast -f"
-echo "  Customise:   edit ~/.config/gotubecast/env  (SCREEN_NAME, MPV_OPTS, …)"
-echo ""
-echo "For a fullscreen dedicated display:"
-echo "  echo 'MPV_OPTS=--fullscreen' >> ~/.config/gotubecast/env"
-echo "  systemctl --user restart gotubecast-cast"
+if [[ "${UPDATE_ONLY}" -eq 0 ]]; then
+    echo "Done!  Gesture summary:"
+    echo "  Tap              → pause / unpause"
+    echo "  Swipe left/right → seek (or previous/next video)"
+    echo "  Swipe up/down (right half) → volume"
+    echo "  Long-press       → uosc context menu"
+    echo "  ✕ in controls bar → quit mpv"
+    echo ""
+    echo "Service management:"
+    echo "  Start now:   systemctl --user start gotubecast-cast"
+    echo "  View logs:   journalctl --user -u gotubecast-cast -f"
+    echo "  Customise:   edit ~/.config/gotubecast/env  (SCREEN_NAME, MPV_OPTS, …)"
+    echo ""
+    echo "For a fullscreen dedicated display:"
+    echo "  echo 'MPV_OPTS=--fullscreen' >> ~/.config/gotubecast/env"
+    echo "  systemctl --user restart gotubecast-cast"
+else
+    echo "Update done."
+    echo "  gotubecast → ~/.local/bin/gotubecast"
+    echo "  cast.py    → ~/.local/lib/gotubecast/cast.py"
+    echo "  Restart the service to pick up changes:  systemctl --user restart gotubecast-cast"
+fi

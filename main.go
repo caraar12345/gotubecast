@@ -143,7 +143,9 @@ func main() {
 		"name":          {screenName},
 		"app":           {screenApp},
 		"theme":         {"cl"},
-		"capabilities":  {},
+		// Must be non-empty: url.Values with an empty slice omits the key entirely,
+		// and YouTube will not send cast/playlist commands to a receiver with no caps.
+		"capabilities": {"que,mus"},
 		"mdx-version":   {"2"},
 		"loungeIdToken": {tokenScreenItem.LoungeToken},
 		"VER":           {"8"},
