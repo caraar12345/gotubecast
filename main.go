@@ -76,7 +76,7 @@ var (
 )
 
 func init() {
-	flag.IntVar(&debugLevel, "d", 0, "Debug information level. 0 = off; 1 = full cmd info; 2 = timestamp prefix")
+	flag.IntVar(&debugLevel, "d", 2, "Debug information level. 0 = off; 1 = full cmd info; 2 = timestamp prefix")
 	flag.StringVar(&screenName, "n", defaultScreenName, "Display Name")
 	flag.StringVar(&screenApp, "i", defaultScreenApp, "Display App")
 	flag.StringVar(&screenId, "s", "", "Screen ID (will be generated if empty)")

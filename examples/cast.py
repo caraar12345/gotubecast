@@ -344,7 +344,7 @@ def main() -> None:
         "gotubecast",
         "-n", SCREEN_NAME,
         "-i", SCREEN_APP,
-        "-p", str(DIAL_PORT),
+        "-p", str(DIAL_PORT)
     ]
     if SCREEN_ID:
         gtc_cmd.extend(["-s", SCREEN_ID])
@@ -362,6 +362,8 @@ def main() -> None:
     try:
         for line in proc.stdout:
             dispatch(line.rstrip())
+        for line in proc.stderr:
+            print(line)
     except KeyboardInterrupt:
         pass
     finally:
