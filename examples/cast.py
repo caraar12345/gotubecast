@@ -24,6 +24,7 @@ Configuration (environment variables):
     DIAL_PORT       DIAL HTTP server port                    (default: 8008)
     GTC_DEBUG_LEVEL gotubecast debug level                   (default: 2)
     GTC_DEBUG_LOG   gotubecast debug log file path           (default: $XDG_RUNTIME_DIR/gotubecast/gotubecast-debug.log)
+    GTC_DEBUG_ROOT_CA PEM path for extra TLS roots (MITM proxy) → -debug-root-ca
     GTC_TRACE_PROTOCOL Enable protocol trace logging (0/1)   (default: 0)
     SUB_LANG        Subtitle language code, e.g. "en"        (default: en, blank to disable)
     VIDEO_QUALITY   Maximum video height in pixels           (default: 1080)
@@ -69,6 +70,7 @@ TEMP_DIR   = RUNTIME_DIR / "downloads"
 GTC_DEBUG_LOG = os.environ.get(
     "GTC_DEBUG_LOG", str(RUNTIME_DIR / "gotubecast-debug.log")
 )
+GTC_DEBUG_ROOT_CA = os.environ.get("GTC_DEBUG_ROOT_CA", "").strip()
 
 # ---------------------------------------------------------------------------
 # State
@@ -370,6 +372,8 @@ def main() -> None:
     ]
     if GTC_TRACE_PROTOCOL not in ("", "0", "false", "False", "FALSE", "no", "No", "NO"):
         gtc_cmd.append("-trace-protocol")
+    if GTC_DEBUG_ROOT_CA:
+        gtc_cmd.extend(["-debug-root-ca", GTC_DEBUG_ROOT_CA])
     if SCREEN_ID:
         gtc_cmd.extend(["-s", SCREEN_ID])
 

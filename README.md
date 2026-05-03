@@ -43,6 +43,8 @@ Usage help:
 			Debug information level. 0 = off; 1 = full cmd info; 2 = timestamp prefix (debug logs go to file)
 	  -debug-log-file string
 			Path to debug log file (used when -d >= 1) (default "gotubecast-debug.log")
+	  -debug-root-ca string
+			Path to PEM file with extra root CA(s) for outbound HTTPS (e.g. Proxygen); system roots are retained. Works with HTTPS_PROXY.
 	  -i string
 			Display App (default "golang-test-838")
 	  -n string

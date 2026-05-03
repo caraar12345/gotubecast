@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"net/http"
 	"net/url"
 	"os"
 	"strconv"
@@ -51,19 +50,20 @@ const (
 )
 
 var (
-	debugLevel    int
-	debugLogPath  string
-	debugLogFile  *os.File
-	traceProtocol bool
-	screenId      string
-	screenName    string
-	screenApp     string
-	bindVals      url.Values
-	currentVolume string = "100"
-	currentMuted  bool   = false
-	ofs           uint64 = 0
-	playState     string = "3"
-	ctt           string
+	debugLevel      int
+	debugLogPath    string
+	debugRootCAPath string
+	debugLogFile    *os.File
+	traceProtocol   bool
+	screenId        string
+	screenName      string
+	screenApp       string
+	bindVals        url.Values
+	currentVolume   string = "100"
+	currentMuted    bool   = false
+	ofs             uint64 = 0
+	playState       string = "3"
+	ctt             string
 	//playTimer     *time.Timer
 	currentCmdIndex int64
 
@@ -83,6 +83,7 @@ var (
 func init() {
 	flag.IntVar(&debugLevel, "d", 2, "Debug information level. 0 = off; 1 = full cmd info; 2 = timestamp prefix")
 	flag.StringVar(&debugLogPath, "debug-log-file", "gotubecast-debug.log", "Path to debug log file (used when -d >= 1)")
+	flag.StringVar(&debugRootCAPath, "debug-root-ca", "", "Path to PEM file with extra root CA(s) for outbound HTTPS (e.g. TLS-inspecting proxy); system roots are kept")
 	flag.BoolVar(&traceProtocol, "trace-protocol", false, "Trace incoming commands and outgoing bind responses in debug log")
 	flag.StringVar(&screenName, "n", defaultScreenName, "Display Name")
 	flag.StringVar(&screenApp, "i", defaultScreenApp, "Display App")
@@ -91,6 +92,9 @@ func init() {
 
 func main() {
 	flag.Parse()
+	if err := initOutboundHTTP(debugRootCAPath); err != nil {
+		panic(err)
+	}
 	defer func() {
 		if debugLogFile != nil {
 			debugLogFile.Close()
@@ -105,7 +109,7 @@ func main() {
 	}
 	// screen id:
 	if screenId == "" {
-		resp, err := http.Get("https://www.youtube.com/api/lounge/pairing/generate_screen_id")
+		resp, err := outboundHTTP.Get("https://www.youtube.com/api/lounge/pairing/generate_screen_id")
 		if err != nil {
 			panic(err)
 		}
@@ -114,12 +118,12 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-		screenId = string(body)
+		screenId = strings.TrimSpace(string(body))
 	}
 	msgPrintln(fmt.Sprint("screen_id ", screenId))
 
 	// lounge token:
-	resp, err := http.PostForm("https://www.youtube.com/api/lounge/pairing/get_lounge_token_batch", url.Values{"screen_ids": {screenId}})
+	resp, err := outboundHTTP.PostForm("https://www.youtube.com/api/lounge/pairing/get_lounge_token_batch", url.Values{"screen_ids": {screenId}})
 	if err != nil {
 		panic(err)
 	}
@@ -138,14 +142,14 @@ func main() {
 	msgPrintln(fmt.Sprint("lounge_token ", tokenScreenItem.LoungeToken, " ", tokenScreenItem.Expiration/1000))
 
 	bindVals = url.Values{
-		"device":        {"LOUNGE_SCREEN"},
-		"id":            {screenUid},
-		"name":          {screenName},
-		"app":           {screenApp},
-		"theme":         {"cl"},
+		"device": {"LOUNGE_SCREEN"},
+		"id":     {screenUid},
+		"name":   {screenName},
+		"app":    {screenApp},
+		"theme":  {"cl"},
 		// Must be non-empty: url.Values with an empty slice omits the key entirely,
 		// and YouTube will not send cast/playlist commands to a receiver with no caps.
-		"capabilities": {"que,mus"},
+		"capabilities":  {"que,mus"},
 		"mdx-version":   {"2"},
 		"loungeIdToken": {tokenScreenItem.LoungeToken},
 		"VER":           {"8"},
@@ -157,7 +161,7 @@ func main() {
 	}
 
 	// bind 1
-	resp, err = http.PostForm("https://www.youtube.com/api/lounge/bc/bind?"+bindVals.Encode(), url.Values{"count": {"0"}})
+	resp, err = outboundHTTP.PostForm("https://www.youtube.com/api/lounge/bc/bind?"+bindVals.Encode(), url.Values{"count": {"0"}})
 	if err != nil {
 		panic(err)
 	}
@@ -170,7 +174,7 @@ func main() {
 	// pairing code every 5 minutes:
 	go func() {
 		for {
-			resp, err = http.PostForm("https://www.youtube.com/api/lounge/pairing/get_pairing_code?ctx=pair", url.Values{
+			resp, err = outboundHTTP.PostForm("https://www.youtube.com/api/lounge/pairing/get_pairing_code?ctx=pair", url.Values{
 				"access_type":  {"permanent"},
 				"app":          {screenApp},
 				"lounge_token": {tokenScreenItem.LoungeToken},
@@ -211,7 +215,7 @@ func main() {
 		bindValsGet["CI"] = []string{"0"}
 		bindValsGet["TYPE"] = []string{"xmlhttp"}
 		bindValsGet["AID"] = []string{strconv.FormatInt(currentCmdIndex, 10)}
-		resp, err = http.Get("https://www.youtube.com/api/lounge/bc/bind?" + bindValsGet.Encode())
+		resp, err = outboundHTTP.Get("https://www.youtube.com/api/lounge/bc/bind?" + bindValsGet.Encode())
 		if err != nil {
 			errCount++
 			msgPrintln(fmt.Sprint("error ", err.Error()))
@@ -320,35 +324,35 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		curVideoId = videoID
 		dialStateMu.Unlock()
 		/*
-		curListId = data["listId"].(string)
-		info := getListInfo(curListId)
-		curListVideos = info.Video
-		currentTime := ""
-		if data["currentTime"] != nil {
-			currentTime = data["currentTime"].(string)
-		}
-		videoIds := data["videoIds"].(string)
-		curList = strings.Split(videoIds, ",")
-		curVideo = curListVideos[0]
-		if data["currentIndex"] != nil {
-			curIndex, err := strconv.Atoi(data["currentIndex"].(string))
-			if err == nil {
-				curVideo = curListVideos[curIndex]
+			curListId = data["listId"].(string)
+			info := getListInfo(curListId)
+			curListVideos = info.Video
+			currentTime := ""
+			if data["currentTime"] != nil {
+				currentTime = data["currentTime"].(string)
 			}
-		}
+			videoIds := data["videoIds"].(string)
+			curList = strings.Split(videoIds, ",")
+			curVideo = curListVideos[0]
+			if data["currentIndex"] != nil {
+				curIndex, err := strconv.Atoi(data["currentIndex"].(string))
+				if err == nil {
+					curVideo = curListVideos[curIndex]
+				}
+			}
 
-		// set startTime:
-		currentTimeDuration, err := time.ParseDuration(currentTime + "s")
-		if err != nil {
-			currentTimeDuration = 0
-		}
-		curTime = currentTimeDuration
-		startTime = time.Now().Add(-curTime)
-		var ok bool
-		ctt, ok = data["ctt"].(string)
-		if !ok {
-			ctt = ""
-		}
+			// set startTime:
+			currentTimeDuration, err := time.ParseDuration(currentTime + "s")
+			if err != nil {
+				currentTimeDuration = 0
+			}
+			curTime = currentTimeDuration
+			startTime = time.Now().Add(-curTime)
+			var ok bool
+			ctt, ok = data["ctt"].(string)
+			if !ok {
+				ctt = ""
+			}
 
 		*/
 		if curVideoId != "" {
@@ -380,25 +384,25 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 			}
 		}
 		/*
-		postBind("nowPlaying", map[string]string{
-			"videoId":      curVideoId,
-			"currentTime":  currentTime,
-			"ctt":          ctt,
-			"listId":       curListId,
-			"currentIndex": strconv.Itoa(curIndex),
-			"state":        "3",
-		})
-		playState = "1"
-		postBind("onStateChange", map[string]string{
-			"currentTime": currentTime,
-			"state":       "1",
-			"duration":    strconv.Itoa(curVideo.Length),
-			"cpn":         "foo",
-		})
+			postBind("nowPlaying", map[string]string{
+				"videoId":      curVideoId,
+				"currentTime":  currentTime,
+				"ctt":          ctt,
+				"listId":       curListId,
+				"currentIndex": strconv.Itoa(curIndex),
+				"state":        "3",
+			})
+			playState = "1"
+			postBind("onStateChange", map[string]string{
+				"currentTime": currentTime,
+				"state":       "1",
+				"duration":    strconv.Itoa(curVideo.Length),
+				"cpn":         "foo",
+			})
 		*/
 	// FIXME
 	//case "updatePlaylist":
-		/*
+	/*
 		data := paramsList[0].(map[string]interface{})
 		curListId = data["listId"].(string)
 		if data["videoIds"] != nil {
@@ -414,7 +418,7 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		}
 		info := getListInfo(curListId)
 		curListVideos = info.Video
-		*/
+	*/
 	case "play":
 		msgPrintln("play")
 		playState = "1"
@@ -639,7 +643,7 @@ func postBind(sc string, params map[string]string) {
 	if traceProtocol {
 		dbgPrintln(fmt.Sprintf("proto_out sc=%s params=%s", sc, formatURLValues(postVals)))
 	}
-	resp, err := http.PostForm("https://www.youtube.com/api/lounge/bc/bind?"+bindVals.Encode(), postVals)
+	resp, err := outboundHTTP.PostForm("https://www.youtube.com/api/lounge/bc/bind?"+bindVals.Encode(), postVals)
 	if err != nil {
 		panic(err)
 	}
@@ -670,7 +674,7 @@ func debugInfo() {
 }
 
 func getListInfo(listId string) (ret *PlaylistInfo) {
-	resp, err := http.Get("https://www.youtube.com/list_ajax?style=json&action_get_list=1&list=" + listId)
+	resp, err := outboundHTTP.Get("https://www.youtube.com/list_ajax?style=json&action_get_list=1&list=" + listId)
 	if err != nil {
 		panic(err)
 	}

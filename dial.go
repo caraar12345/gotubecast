@@ -168,20 +168,21 @@ func handleYouTubeApp(w http.ResponseWriter, r *http.Request) {
 }
 
 // registerDialPairingCode tells YouTube to associate the phone-generated DIAL
-// pairing code with our screen's lounge token. Without this the phone's
-// follow-up GET /api/lounge/pairing/get_screen?pairing_code=<UUID> returns 404
-// and the phone aborts the DIAL launch.
+// pairing UUID with our screen_id. Without this the phone's POST
+// /api/lounge/pairing/get_screen returns 404 and aborts the DIAL launch.
+//
+// Use register_pairing_code (see aykevl/plaincast), not get_pairing_code:
+// get_pairing_code?ctx=pair is for generating TV display codes; posting a
+// client pairing_code there returns HTTP 200 with a numeric body but does not
+// wire get_screen — Proxygen showed 404 on get_screen despite "200" responses.
 func registerDialPairingCode(code string) {
 	dialTracef("pairing_register_start pairing_code=%s", code)
 	vals := url.Values{
 		"access_type":  {"permanent"},
-		"app":          {screenApp},
-		"lounge_token": {currentLoungeToken},
-		"screen_id":    {screenId},
-		"screen_name":  {screenName},
 		"pairing_code": {code},
+		"screen_id":    {screenId},
 	}
-	resp, err := http.PostForm("https://www.youtube.com/api/lounge/pairing/get_pairing_code?ctx=pair", vals)
+	resp, err := outboundHTTP.PostForm("https://www.youtube.com/api/lounge/pairing/register_pairing_code", vals)
 	if err != nil {
 		dbgPrintln(fmt.Sprintf("dial: pairing register error: %v", err))
 		return
