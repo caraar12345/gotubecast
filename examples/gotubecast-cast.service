@@ -14,9 +14,8 @@ RestartSec=5
 # is found when cast.py spawns it as a subprocess.
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:%h/.local/bin
 
-# Display server — uncomment the line that matches your Pi setup:
-Environment=DISPLAY=:0
-#Environment=WAYLAND_DISPLAY=wayland-1
+# Wayland display socket (labwc on Raspberry Pi OS uses wayland-0).
+Environment=WAYLAND_DISPLAY=wayland-0
 
 # Uncomment for a dedicated fullscreen display:
 #Environment=MPV_OPTS=--fullscreen
