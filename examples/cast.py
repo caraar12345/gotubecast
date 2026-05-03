@@ -7,13 +7,15 @@ The YouTube app on your phone discovers this device automatically via DIAL/SSDP
 and connects through the YouTube Lounge API (see https://github.com/FabioGNR/pyytlounge).
 
 Requirements:
-    apt install mpv
-    pip install yt-dlp          # or: apt install yt-dlp
+    bash examples/setup.sh   # installs mpv, yt-dlp, uosc, and touch-gestures
+    go build .               # build gotubecast binary and put it on PATH
 
-Touch controls (provided by mpv-touch.lua, auto-loaded from the same directory):
-    Tap anywhere   → reveal control bar
-    [Vol−] [Play/Pause] [Vol+] [✕ Stop]  — bottom quarter of the screen
-    Two-finger swipe / scroll             → volume up/down (always active)
+Touch controls (installed by setup.sh — uosc + mpv-touch-gestures):
+    Tap            → pause/unpause
+    Swipe left/right     → seek
+    Swipe up/down (right half) → volume
+    Long-press     → uosc context menu (subtitle/audio track, quality, etc.)
+    ✕ button in controls bar → quit mpv
 
 Configuration (environment variables):
     SCREEN_NAME     Friendly name shown in the YouTube app   (default: GoTubeCast Pi)
@@ -33,7 +35,6 @@ import json
 import os
 import socket
 import subprocess
-import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -52,8 +53,6 @@ MPV_EXTRA     = os.environ.get("MPV_OPTS",      "").split()
 
 MPV_SOCKET = "/tmp/gotubecast-mpv.sock"
 TEMP_DIR   = Path(tempfile.gettempdir()) / "gotubecast"
-SCRIPT_DIR = Path(__file__).parent
-MPV_TOUCH  = SCRIPT_DIR / "mpv-touch.lua"
 
 # ---------------------------------------------------------------------------
 # State
@@ -196,11 +195,8 @@ def play_video(video_id: str) -> None:
         "--force-window=yes",
         "--keep-open=no",
         "--really-quiet",
-        "--no-osc",                        # replaced by mpv-touch.lua
-    ]
-    if MPV_TOUCH.exists():
-        cmd.append(f"--script={MPV_TOUCH}")
-    cmd += MPV_EXTRA
+        "--no-osc",                        # replaced by uosc (installed by setup.sh)
+    ] + MPV_EXTRA
 
     for sub in sub_result:
         cmd.append(f"--sub-file={sub}")
