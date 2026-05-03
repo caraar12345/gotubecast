@@ -16,7 +16,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
-	//"strings"
+	"strings"
 	"sync"
 	"time"
 )
@@ -260,7 +260,7 @@ func decodeBindStream(r io.Reader) (err error) {
 // genericCmd interpretes and executes commands from the bind stream
 func genericCmd(index int64, cmd string, paramsList []interface{}) {
 	//debugInfo()
-	dbgPrintln(fmt.Sprintf("raw_cmd %v %v %#v", index, cmd, paramsList))
+	dbgPrintln(fmt.Sprintf("raw_cmd idx=%d cmd=%s params=%s", index, cmd, formatDebugParams(paramsList)))
 	if currentCmdIndex > 0 && index <= currentCmdIndex {
 		dbgPrintln(fmt.Sprintf("skipping already seen cmd %d", index))
 		return
@@ -577,4 +577,58 @@ func dbgPrintln(line string) {
 			fmt.Fprintln(debugLogFile, fmt.Sprint("dbg ", line))
 		}
 	}
+}
+
+func formatDebugParams(params []interface{}) string {
+	normalized := normalizeDebugValue(params)
+	body, err := json.Marshal(normalized)
+	if err != nil {
+		return fmt.Sprintf("%v", params)
+	}
+	return string(body)
+}
+
+func normalizeDebugValue(v interface{}) interface{} {
+	switch val := v.(type) {
+	case map[string]interface{}:
+		normalized := make(map[string]interface{}, len(val))
+		for key, item := range val {
+			normalized[key] = normalizeDebugValue(item)
+		}
+		return normalized
+	case []interface{}:
+		normalized := make([]interface{}, len(val))
+		for i, item := range val {
+			normalized[i] = normalizeDebugValue(item)
+		}
+		return normalized
+	case string:
+		if parsed, ok := parseEmbeddedJSON(val); ok {
+			return normalizeDebugValue(parsed)
+		}
+		return val
+	default:
+		return val
+	}
+}
+
+func parseEmbeddedJSON(s string) (interface{}, bool) {
+	trimmed := strings.TrimSpace(s)
+	if len(trimmed) < 2 {
+		return nil, false
+	}
+	isObject := trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}'
+	isArray := trimmed[0] == '[' && trimmed[len(trimmed)-1] == ']'
+	if !isObject && !isArray {
+		return nil, false
+	}
+
+	var parsed interface{}
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	dec.UseNumber()
+	if err := dec.Decode(&parsed); err != nil {
+		return nil, false
+	}
+
+	return parsed, true
 }
