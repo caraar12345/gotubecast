@@ -203,9 +203,14 @@ func main() {
 			return
 		}
 		ofs++
-		bindValsGet := bindVals
+		// Must clone: bindVals is a map; `bindValsGet := bindVals` aliases the same map,
+		// so assigning RID/CI would corrupt long-lived POST state (CI leaked onto every
+		// postBind URL and broke remote/playlist delivery).
+		bindValsGet := cloneURLValues(bindVals)
 		bindValsGet["RID"] = []string{"rpc"}
 		bindValsGet["CI"] = []string{"0"}
+		bindValsGet["TYPE"] = []string{"xmlhttp"}
+		bindValsGet["AID"] = []string{strconv.FormatInt(currentCmdIndex, 10)}
 		resp, err = http.Get("https://www.youtube.com/api/lounge/bc/bind?" + bindValsGet.Encode())
 		if err != nil {
 			errCount++
@@ -593,6 +598,19 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 			debugInfo()
 		}
 	*/
+}
+
+func cloneURLValues(v url.Values) url.Values {
+	if v == nil {
+		return nil
+	}
+	out := make(url.Values, len(v))
+	for k, vals := range v {
+		cp := make([]string, len(vals))
+		copy(cp, vals)
+		out[k] = cp
+	}
+	return out
 }
 
 func getMapString(data map[string]interface{}, key string) string {
