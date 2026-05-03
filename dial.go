@@ -149,7 +149,10 @@ func handleYouTubeApp(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if code != "" {
-			go registerDialPairingCode(code)
+			// Register before responding: iOS polls get_screen immediately after
+			// 201; a background goroutine loses the race and get_screen stays 404
+			// until the client gives up (Proxygen).
+			registerDialPairingCode(code)
 		} else {
 			dialTracef("youtube_post_missing_pairing_code")
 		}
