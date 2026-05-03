@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/xml"
 	"flag"
 	"fmt"
@@ -57,14 +58,22 @@ func startDIAL() {
 	mux.HandleFunc("/apps/YouTube", handleYouTubeApp)
 	mux.HandleFunc("/apps/", handleApps)
 
+	addr := fmt.Sprintf(":%d", dialHTTPPort)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		msgPrintln(fmt.Sprintf("error DIAL HTTP bind: %v", err))
+		return
+	}
+	srv := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	go func() {
-		srv := &http.Server{
-			Addr:              fmt.Sprintf(":%d", dialHTTPPort),
-			Handler:           mux,
-			ReadHeaderTimeout: 5 * time.Second,
-		}
-		dialTracef("http_listen addr=%s local_ip=%s", srv.Addr, dialLocalIP)
-		if err := srv.ListenAndServe(); err != nil {
+		dialTracef("http_serve addr=%s local_ip=%s", ln.Addr().String(), dialLocalIP)
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			msgPrintln(fmt.Sprintf("error DIAL HTTP: %v", err))
 		}
 	}()
@@ -152,13 +161,18 @@ func handleYouTubeApp(w http.ResponseWriter, r *http.Request) {
 			// Register before responding: iOS polls get_screen immediately after
 			// 201; a background goroutine loses the race and get_screen stays 404
 			// until the client gives up (Proxygen).
-			registerDialPairingCode(code)
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			registerDialPairingCode(ctx, code)
+			cancel()
 		} else {
 			dialTracef("youtube_post_missing_pairing_code")
 		}
 		w.Header().Set("Location", fmt.Sprintf("http://%s:%d/apps/YouTube/run", dialLocalIP, dialHTTPPort))
 		w.WriteHeader(http.StatusCreated)
 	case http.MethodDelete:
+		dialStateMu.Lock()
+		curVideoId = ""
+		dialStateMu.Unlock()
 		msgPrintln("stop")
 		w.WriteHeader(http.StatusOK)
 	default:
@@ -175,14 +189,21 @@ func handleYouTubeApp(w http.ResponseWriter, r *http.Request) {
 // get_pairing_code?ctx=pair is for generating TV display codes; posting a
 // client pairing_code there returns HTTP 200 with a numeric body but does not
 // wire get_screen — Proxygen showed 404 on get_screen despite "200" responses.
-func registerDialPairingCode(code string) {
+func registerDialPairingCode(ctx context.Context, code string) {
 	dialTracef("pairing_register_start pairing_code=%s", code)
 	vals := url.Values{
 		"access_type":  {"permanent"},
 		"pairing_code": {code},
 		"screen_id":    {screenId},
 	}
-	resp, err := outboundHTTP.PostForm("https://www.youtube.com/api/lounge/pairing/register_pairing_code", vals)
+	u := "https://www.youtube.com/api/lounge/pairing/register_pairing_code"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(vals.Encode()))
+	if err != nil {
+		dbgPrintln(fmt.Sprintf("dial: pairing register request: %v", err))
+		return
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := outboundHTTP.Do(req)
 	if err != nil {
 		dbgPrintln(fmt.Sprintf("dial: pairing register error: %v", err))
 		return
@@ -196,6 +217,9 @@ func registerDialPairingCode(code string) {
 func handleYouTubeInstance(w http.ResponseWriter, r *http.Request) {
 	dialTracef("http_req method=%s path=%s remote=%s ua=%q", r.Method, r.URL.Path, r.RemoteAddr, r.UserAgent())
 	if r.Method == http.MethodDelete {
+		dialStateMu.Lock()
+		curVideoId = ""
+		dialStateMu.Unlock()
 		msgPrintln("stop")
 		w.WriteHeader(http.StatusOK)
 		return

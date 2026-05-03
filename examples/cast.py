@@ -81,6 +81,7 @@ _mpv_proc = None
 _mpv_lock = threading.Lock()
 _play_generation     = 0   # incremented on each play_video(); guards stale fetches
 _subtitle_generation = 0   # incremented on each subtitle change; guards stale loads
+_active_video_id: str | None = None  # video currently tied to mpv; cleared between plays / on stop
 
 # ---------------------------------------------------------------------------
 # mpv IPC
@@ -255,10 +256,11 @@ def _reap_mpv() -> None:
 
 
 def play_video(video_id: str) -> None:
-    global _mpv_proc, _play_generation
+    global _mpv_proc, _play_generation, _active_video_id
     with _mpv_lock:
         _play_generation += 1
         generation = _play_generation
+        _active_video_id = None
         _reap_mpv()
 
         TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -318,6 +320,7 @@ def play_video(video_id: str) -> None:
         # Abort if a newer play_video() call has already taken over.
         if generation != _play_generation:
             return
+        _active_video_id = video_id
         _mpv_proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
 
 
@@ -326,11 +329,13 @@ def load_subtitle_track(video_id: str, lang: str, generation: int) -> None:
     if not lang:
         mpv_ipc({"command": ["set_property", "sid", "no"]})
         return
+    with _mpv_lock:
+        if generation != _subtitle_generation or video_id != _active_video_id:
+            return
     sub = fetch_subtitles(video_id, lang)
     if sub:
         with _mpv_lock:
-            # Abort if a newer subtitle selection has superseded this one.
-            if generation != _subtitle_generation:
+            if generation != _subtitle_generation or video_id != _active_video_id:
                 return
         mpv_ipc({"command": ["sub-add", str(sub), "select"]})
 
@@ -339,7 +344,7 @@ def load_subtitle_track(video_id: str, lang: str, generation: int) -> None:
 # ---------------------------------------------------------------------------
 
 def dispatch(line: str) -> None:
-    global _subtitle_generation
+    global _subtitle_generation, _play_generation, _active_video_id
 
     parts = line.split()
     if not parts:
@@ -368,6 +373,8 @@ def dispatch(line: str) -> None:
 
     elif cmd == "stop":
         with _mpv_lock:
+            _play_generation += 1
+            _active_video_id = None
             _reap_mpv()
 
     elif cmd == "seek_to":
@@ -458,8 +465,6 @@ def main() -> None:
     try:
         for line in proc.stdout:
             dispatch(line.rstrip())
-        for line in proc.stderr:
-            print(line)
     except KeyboardInterrupt:
         pass
     finally:

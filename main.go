@@ -106,11 +106,12 @@ func main() {
 		}
 	}()
 	if debugLevel >= 1 {
-		file, err := os.OpenFile(debugLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		file, err := os.OpenFile(debugLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 		if err != nil {
 			panic(fmt.Sprintf("failed to open debug log file %q: %v", debugLogPath, err))
 		}
 		debugLogFile = file
+		_ = os.Chmod(debugLogPath, 0600)
 	}
 	// screen id:
 	if screenId == "" {
@@ -141,6 +142,9 @@ func main() {
 	err = json.Unmarshal(body, &tokenObj)
 	if err != nil {
 		panic(err)
+	}
+	if len(tokenObj.Screens) == 0 {
+		panic("get_lounge_token_batch returned no screens")
 	}
 	tokenScreenItem := tokenObj.Screens[0]
 	currentLoungeToken = tokenScreenItem.LoungeToken
@@ -215,7 +219,9 @@ func main() {
 		// Must clone: bindVals is a map; `bindValsGet := bindVals` aliases the same map,
 		// so assigning RID/CI would corrupt long-lived POST state (CI leaked onto every
 		// postBind URL and broke remote/playlist delivery).
+		postBindMu.Lock()
 		bindValsGet := cloneURLValues(bindVals)
+		postBindMu.Unlock()
 		bindValsGet["RID"] = []string{"rpc"}
 		bindValsGet["CI"] = []string{"0"}
 		bindValsGet["TYPE"] = []string{"xmlhttp"}
@@ -374,11 +380,15 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		//msgPrintln("noop")
 	case "c":
 		sid := paramsList[0].(string)
+		postBindMu.Lock()
 		bindVals["SID"] = []string{sid}
+		postBindMu.Unlock()
 		msgPrintln(fmt.Sprint("option_sid ", sid))
 	case "S":
 		gsessionid := paramsList[0].(string)
+		postBindMu.Lock()
 		bindVals["gsessionid"] = []string{gsessionid}
+		postBindMu.Unlock()
 		msgPrintln(fmt.Sprint("option_gsessionid ", gsessionid))
 	case "remoteConnected":
 		data := paramsList[0].(map[string]interface{})
@@ -390,17 +400,26 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		id := data["id"].(string)
 		msgPrintln(fmt.Sprint("remote_leave ", id))
 	case "getNowPlaying":
-		curTime = time.Since(startTime)
-		if curVideoId == "" {
+		playbackMu.Lock()
+		if playState == "1" {
+			curTime = time.Since(startTime)
+		}
+		curTimeSnap := curTime
+		playStateSnap := playState
+		playbackMu.Unlock()
+		dialStateMu.RLock()
+		videoIDNow := curVideoId
+		dialStateMu.RUnlock()
+		if videoIDNow == "" {
 			postBind("nowPlaying", map[string]string{})
 		} else {
 			postBind("nowPlaying", map[string]string{
-				"videoId":      curVideoId,
-				"currentTime":  fmt.Sprintf("%.3f", curTime.Seconds()),
+				"videoId":      videoIDNow,
+				"currentTime":  fmt.Sprintf("%.3f", curTimeSnap.Seconds()),
 				"ctt":          ctt,
 				"listId":       curListId,
 				"currentIndex": strconv.Itoa(curIndex),
-				"state":        playState,
+				"state":        playStateSnap,
 			})
 		}
 	case "setPlaylist":
@@ -565,7 +584,9 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		langCode, _ := data["languageCode"].(string)
 		videoId, _ := data["videoId"].(string)
 		if videoId == "" {
+			dialStateMu.RLock()
 			videoId = curVideoId
+			dialStateMu.RUnlock()
 		}
 		if langCode == "" {
 			msgPrintln("set_subtitles off")
@@ -625,8 +646,11 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		msgPrintln("next")
 		if curIndex+1 < len(curList) {
 			curIndex++
+			playbackMu.Lock()
 			curTime = 0
 			startTime = time.Now()
+			playState = "1"
+			playbackMu.Unlock()
 			dialStateMu.Lock()
 			curVideoId = curList[curIndex]
 			dialStateMu.Unlock()
@@ -639,7 +663,6 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 				"currentIndex": strconv.Itoa(curIndex),
 				"state":        "3",
 			})
-			playState = "1"
 			postBind("onStateChange", map[string]string{
 				"currentTime": "0",
 				"state":       "1",
@@ -651,8 +674,11 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		msgPrintln("previous")
 		if curIndex > 0 {
 			curIndex--
+			playbackMu.Lock()
 			curTime = 0
 			startTime = time.Now()
+			playState = "1"
+			playbackMu.Unlock()
 			dialStateMu.Lock()
 			curVideoId = curList[curIndex]
 			dialStateMu.Unlock()
@@ -665,7 +691,6 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 				"currentIndex": strconv.Itoa(curIndex),
 				"state":        "3",
 			})
-			playState = "1"
 			postBind("onStateChange", map[string]string{
 				"currentTime": "0",
 				"state":       "1",

@@ -178,10 +178,17 @@ echo ">>> Installing systemd user service..."
 SYSTEMD_USER="${HOME}/.config/systemd/user"
 mkdir -p "${SYSTEMD_USER}"
 cp "${REPO_DIR}/examples/gotubecast-cast.service" "${SYSTEMD_USER}/gotubecast-cast.service"
-systemctl --user daemon-reload
+if ! systemctl --user daemon-reload 2>/dev/null; then
+    echo "    WARNING: systemctl --user daemon-reload failed (no user systemd session?). When logged in, run:"
+    echo "            systemctl --user daemon-reload"
+fi
 if [[ "${UPDATE_ONLY}" -eq 0 ]]; then
-    systemctl --user enable gotubecast-cast
-    echo "    Enabled gotubecast-cast (not started — see note below)."
+    if ! systemctl --user enable gotubecast-cast 2>/dev/null; then
+        echo "    WARNING: systemctl --user enable gotubecast-cast failed. When logged in, run:"
+        echo "            systemctl --user enable --now gotubecast-cast"
+    else
+        echo "    Enabled gotubecast-cast (not started — see note below)."
+    fi
 else
     echo "    Refreshed gotubecast-cast.service (run: systemctl --user daemon-reload already done)."
 fi
