@@ -8,13 +8,18 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -82,6 +87,14 @@ var (
 	printLock     sync.Mutex
 	playbackMu    sync.Mutex
 	postBindMu    sync.Mutex
+	loungeCPN     string // Client Playback Nonce; refreshed per video for Lounge bind
+)
+
+// YouTube watch HTML embeds duration in player response JSON.
+var (
+	reYouTubeLengthQuoted = regexp.MustCompile(`"lengthSeconds":"(\d+)"`)
+	reYouTubeLengthBare   = regexp.MustCompile(`"lengthSeconds":(\d+)`)
+	reYouTubeApproxMs     = regexp.MustCompile(`"approxDurationMs":"(\d+)"`)
 )
 
 func init() {
@@ -96,6 +109,7 @@ func init() {
 
 func main() {
 	flag.Parse()
+	loungeCPN = newLoungeCPN()
 	go readStdinPlayback()
 	if err := initOutboundHTTP(debugRootCAPath); err != nil {
 		panic(err)
@@ -282,12 +296,129 @@ func decodeBindStream(r io.Reader) (err error) {
 	}
 }
 
-func postBindOnStateChangeLocked() {
+func postBindOnStateChangeEmit() {
+	playbackMu.Lock()
+	curTimeSnap := curTime
+	if playState == "1" {
+		curTimeSnap = time.Since(startTime)
+	}
+	stateSnap := playState
+	cpnSnap := loungeCPN
+	playbackMu.Unlock()
+
+	dialStateMu.RLock()
+	dur := curVideo.Length
+	dialStateMu.RUnlock()
+
 	postBind("onStateChange", map[string]string{
-		"currentTime": fmt.Sprintf("%.3f", curTime.Seconds()),
-		"state":       playState,
-		"duration":    strconv.Itoa(curVideo.Length),
-		"cpn":         "foo",
+		"currentTime": fmt.Sprintf("%.3f", curTimeSnap.Seconds()),
+		"state":       stateSnap,
+		"duration":    strconv.Itoa(dur),
+		"cpn":         cpnSnap,
+	})
+}
+
+func newLoungeCPN() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "gtc-fallback-cpn"
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:])
+}
+
+func parseYouTubeWatchBodyForDuration(body []byte, videoID, source string) int {
+	if len(body) == 0 {
+		return 0
+	}
+	if m := reYouTubeLengthQuoted.FindSubmatch(body); len(m) >= 2 {
+		if n, err := strconv.Atoi(string(m[1])); err == nil && n > 0 {
+			dbgPrintln(fmt.Sprintf("video_meta lengthSeconds=%d id=%s src=%s", n, videoID, source))
+			return n
+		}
+	}
+	if m := reYouTubeLengthBare.FindSubmatch(body); len(m) >= 2 {
+		if n, err := strconv.Atoi(string(m[1])); err == nil && n > 0 {
+			dbgPrintln(fmt.Sprintf("video_meta lengthSeconds(bare)=%d id=%s src=%s", n, videoID, source))
+			return n
+		}
+	}
+	if m := reYouTubeApproxMs.FindSubmatch(body); len(m) >= 2 {
+		if ms, err := strconv.ParseInt(string(m[1]), 10, 64); err == nil && ms > 0 {
+			sec := int(ms / 1000)
+			if sec > 0 {
+				dbgPrintln(fmt.Sprintf("video_meta approxDurationSec=%d id=%s src=%s", sec, videoID, source))
+				return sec
+			}
+		}
+	}
+	return 0
+}
+
+func fetchVideoLengthSeconds(ctx context.Context, videoID string) int {
+	if videoID == "" {
+		return 0
+	}
+	pageURLs := []struct {
+		url    string
+		source string
+	}{
+		{"https://www.youtube.com/watch?v=" + url.QueryEscape(videoID), "www"},
+		{"https://m.youtube.com/watch?v=" + url.QueryEscape(videoID), "m"},
+	}
+	for _, p := range pageURLs {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		resp, err := outboundHTTP.Do(req)
+		if err != nil {
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			continue
+		}
+		body, err := ioutil.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		if n := parseYouTubeWatchBodyForDuration(body, videoID, p.source); n > 0 {
+			return n
+		}
+	}
+	dbgPrintln(fmt.Sprintf("video_meta duration_not_found id=%s", videoID))
+	return 0
+}
+
+// postBindNowPlayingFromGlobals pushes queue position + state so the remote can sync UI.
+func postBindNowPlayingFromGlobals() {
+	playbackMu.Lock()
+	if playState == "1" {
+		curTime = time.Since(startTime)
+	}
+	curTimeSnap := curTime
+	ps := playState
+	playbackMu.Unlock()
+
+	dialStateMu.RLock()
+	vid := curVideoId
+	lid := curListId
+	ct := ctt
+	idx := curIndex
+	dialStateMu.RUnlock()
+	if vid == "" {
+		return
+	}
+	postBind("nowPlaying", map[string]string{
+		"videoId":      vid,
+		"currentTime":  fmt.Sprintf("%.3f", curTimeSnap.Seconds()),
+		"ctt":          ct,
+		"listId":       lid,
+		"currentIndex": strconv.Itoa(idx),
+		"state":        ps,
 	})
 }
 
@@ -297,13 +428,14 @@ func loungeEmitAt(state string, posSec float64) {
 		return
 	}
 	playbackMu.Lock()
-	defer playbackMu.Unlock()
 	playState = state
 	curTime = time.Duration(posSec * float64(time.Second))
 	if state == "1" {
 		startTime = time.Now().Add(-curTime)
 	}
-	postBindOnStateChangeLocked()
+	playbackMu.Unlock()
+	postBindOnStateChangeEmit()
+	postBindNowPlayingFromGlobals()
 	dbgPrintln(fmt.Sprintf("stdin playback_notify state=%s time=%.3f", state, posSec))
 }
 
@@ -328,8 +460,11 @@ func applySetPlaylistPlaybackState(playbackState, currentTimeStr string, notifyP
 	} else {
 		playState = "2"
 	}
-	postBindOnStateChangeLocked()
 	playbackMu.Unlock()
+
+	postBindNowPlayingFromGlobals()
+
+	postBindOnStateChangeEmit()
 
 	if notifyPlayer {
 		if ps == "PLAYING" {
@@ -425,9 +560,44 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 	case "setPlaylist":
 		data := paramsList[0].(map[string]interface{})
 		videoID := getMapString(data, "videoId")
-		dialStateMu.Lock()
-		curVideoId = videoID
-		dialStateMu.Unlock()
+		if lid := getMapString(data, "listId"); lid != "" {
+			curListId = lid
+		}
+		if vids := getMapString(data, "videoIds"); vids != "" {
+			curList = strings.Split(vids, ",")
+		}
+		if idxStr := getMapString(data, "currentIndex"); idxStr != "" {
+			if idx, err := strconv.Atoi(idxStr); err == nil {
+				curIndex = idx
+			}
+		}
+		if c := getMapString(data, "ctt"); c != "" {
+			ctt = c
+		}
+		if videoID != "" {
+			dialStateMu.RLock()
+			prevID := curVideoId
+			prevLen := curVideo.Length
+			dialStateMu.RUnlock()
+			dur := prevLen
+			if prevID != videoID || dur <= 0 {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				dur = fetchVideoLengthSeconds(ctx, videoID)
+				cancel()
+			}
+			dialStateMu.Lock()
+			curVideoId = videoID
+			curVideo = Video{Id: videoID, Length: dur}
+			dialStateMu.Unlock()
+			playbackMu.Lock()
+			loungeCPN = newLoungeCPN()
+			playbackMu.Unlock()
+		} else {
+			dialStateMu.Lock()
+			curVideoId = ""
+			curVideo = Video{}
+			dialStateMu.Unlock()
+		}
 		/*
 			curListId = data["listId"].(string)
 			info := getListInfo(curListId)
@@ -465,6 +635,9 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		}
 		if ps := getMapString(data, "playbackState"); ps != "" {
 			applySetPlaylistPlaybackState(ps, getMapString(data, "currentTime"), true)
+		} else if curVideoId != "" {
+			postBindNowPlayingFromGlobals()
+			postBindOnStateChangeEmit()
 		}
 	case "addVideo":
 		data := paramsList[0].(map[string]interface{})
@@ -532,15 +705,17 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		playbackMu.Lock()
 		playState = "1"
 		startTime = time.Now().Add(-curTime)
-		postBindOnStateChangeLocked()
 		playbackMu.Unlock()
+		postBindOnStateChangeEmit()
+		postBindNowPlayingFromGlobals()
 	case "pause":
 		msgPrintln("pause")
 		playbackMu.Lock()
 		playState = "2"
 		curTime = time.Since(startTime)
-		postBindOnStateChangeLocked()
 		playbackMu.Unlock()
+		postBindOnStateChangeEmit()
+		postBindNowPlayingFromGlobals()
 	case "getVolume":
 		postBind("onVolumeChanged", map[string]string{"volume": currentVolume, "muted": strconv.FormatBool(currentMuted)})
 	case "setVolume":
@@ -569,11 +744,13 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		playbackMu.Lock()
 		curTime = currentTimeDuration
 		startTime = time.Now().Add(-curTime)
-		postBindOnStateChangeLocked()
 		playbackMu.Unlock()
+		postBindOnStateChangeEmit()
+		postBindNowPlayingFromGlobals()
 	case "stopVideo":
 		dialStateMu.Lock()
 		curVideoId = ""
+		curVideo = Video{}
 		dialStateMu.Unlock()
 		msgPrintln("stop")
 		postBind("nowPlaying", map[string]string{})
@@ -647,56 +824,40 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		if curIndex+1 < len(curList) {
 			curIndex++
 			playbackMu.Lock()
+			loungeCPN = newLoungeCPN()
 			curTime = 0
 			startTime = time.Now()
 			playState = "1"
 			playbackMu.Unlock()
 			dialStateMu.Lock()
 			curVideoId = curList[curIndex]
+			if curIndex < len(curListVideos) {
+				curVideo = curListVideos[curIndex]
+			}
 			dialStateMu.Unlock()
-			curVideo = curListVideos[curIndex]
 			msgPrintln(fmt.Sprint("video_id ", curVideoId))
-			postBind("nowPlaying", map[string]string{
-				"videoId":      curVideoId,
-				"currentTime":  "0",
-				"listId":       curListId,
-				"currentIndex": strconv.Itoa(curIndex),
-				"state":        "3",
-			})
-			postBind("onStateChange", map[string]string{
-				"currentTime": "0",
-				"state":       "1",
-				"duration":    strconv.Itoa(curVideo.Length),
-				"cpn":         "foo",
-			})
+			postBindNowPlayingFromGlobals()
+			postBindOnStateChangeEmit()
 		}
 	case "previous":
 		msgPrintln("previous")
 		if curIndex > 0 {
 			curIndex--
 			playbackMu.Lock()
+			loungeCPN = newLoungeCPN()
 			curTime = 0
 			startTime = time.Now()
 			playState = "1"
 			playbackMu.Unlock()
 			dialStateMu.Lock()
 			curVideoId = curList[curIndex]
+			if curIndex < len(curListVideos) {
+				curVideo = curListVideos[curIndex]
+			}
 			dialStateMu.Unlock()
-			curVideo = curListVideos[curIndex]
 			msgPrintln(fmt.Sprint("video_id ", curVideoId))
-			postBind("nowPlaying", map[string]string{
-				"videoId":      curVideoId,
-				"currentTime":  "0",
-				"listId":       curListId,
-				"currentIndex": strconv.Itoa(curIndex),
-				"state":        "3",
-			})
-			postBind("onStateChange", map[string]string{
-				"currentTime": "0",
-				"state":       "1",
-				"duration":    strconv.Itoa(curVideo.Length),
-				"cpn":         "foo",
-			})
+			postBindNowPlayingFromGlobals()
+			postBindOnStateChangeEmit()
 		}
 	default:
 		msgPrintln(fmt.Sprintf("generic_cmd %s %v", cmd, paramsList))

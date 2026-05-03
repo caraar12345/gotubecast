@@ -172,6 +172,7 @@ func handleYouTubeApp(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		dialStateMu.Lock()
 		curVideoId = ""
+		curVideo = Video{}
 		dialStateMu.Unlock()
 		msgPrintln("stop")
 		w.WriteHeader(http.StatusOK)
@@ -219,6 +220,7 @@ func handleYouTubeInstance(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodDelete {
 		dialStateMu.Lock()
 		curVideoId = ""
+		curVideo = Video{}
 		dialStateMu.Unlock()
 		msgPrintln("stop")
 		w.WriteHeader(http.StatusOK)
