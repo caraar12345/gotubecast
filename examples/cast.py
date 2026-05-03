@@ -24,6 +24,7 @@ Configuration (environment variables):
     DIAL_PORT       DIAL HTTP server port                    (default: 8008)
     GTC_DEBUG_LEVEL gotubecast debug level                   (default: 2)
     GTC_DEBUG_LOG   gotubecast debug log file path           (default: $XDG_RUNTIME_DIR/gotubecast/gotubecast-debug.log)
+    GTC_TRACE_PROTOCOL Enable protocol trace logging (0/1)   (default: 0)
     SUB_LANG        Subtitle language code, e.g. "en"        (default: en, blank to disable)
     VIDEO_QUALITY   Maximum video height in pixels           (default: 1080)
     MPV_OPTS        Extra mpv CLI options (space-separated)
@@ -50,6 +51,7 @@ SCREEN_APP    = os.environ.get("SCREEN_APP",    "gotubecast-pi-v1")
 SCREEN_ID     = os.environ.get("SCREEN_ID",     "")
 DIAL_PORT     = int(os.environ.get("DIAL_PORT", "8008"))
 GTC_DEBUG_LEVEL = os.environ.get("GTC_DEBUG_LEVEL", "2")
+GTC_TRACE_PROTOCOL = os.environ.get("GTC_TRACE_PROTOCOL", "0")
 SUB_LANG      = os.environ.get("SUB_LANG",      "en")
 VIDEO_QUALITY = os.environ.get("VIDEO_QUALITY", "1080")
 MPV_EXTRA     = os.environ.get("MPV_OPTS",      "").split()
@@ -314,6 +316,12 @@ def dispatch(line: str) -> None:
         except (IndexError, ValueError):
             pass
 
+    elif cmd == "mute":
+        mpv_ipc({"command": ["set_property", "mute", True]})
+
+    elif cmd == "unmute":
+        mpv_ipc({"command": ["set_property", "mute", False]})
+
     elif cmd == "set_subtitles":
         # "set_subtitles off"            → disable
         # "set_subtitles <id> <lang>"    → load track
@@ -341,6 +349,12 @@ def dispatch(line: str) -> None:
     elif cmd == "previous":
         mpv_ipc({"command": ["playlist-prev", "force"]})
 
+    elif cmd == "set_playback_rate":
+        try:
+            mpv_ipc({"command": ["set_property", "speed", float(parts[1])]})
+        except (IndexError, ValueError):
+            pass
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -354,6 +368,8 @@ def main() -> None:
         "-d", GTC_DEBUG_LEVEL,
         "-debug-log-file", GTC_DEBUG_LOG,
     ]
+    if GTC_TRACE_PROTOCOL not in ("", "0", "false", "False", "FALSE", "no", "No", "NO"):
+        gtc_cmd.append("-trace-protocol")
     if SCREEN_ID:
         gtc_cmd.extend(["-s", SCREEN_ID])
 

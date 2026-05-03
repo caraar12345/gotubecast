@@ -64,10 +64,18 @@ The following keys are being written to stdout:
 
 ### Other
 * **generic\_cmd \<cmd\> \<params\>**: all non-implemented commands
+* **event \<name\> \<json\>**: structured pass-through for less common Lounge events
 * **remote\_join \<id\> \<name\>**: client connects
 * **remote\_leave \<id\>**: client disconnects
 * **next**
 * **previous**
+* **mute**, **unmute**
+* **skip\_ad**
+* **set\_autoplay\_mode \<mode\>**
+* **set\_audio\_track \<id\> \<language\>**
+* **set\_playback\_quality \<quality\>**
+* **set\_playback\_rate \<rate\>**
+* **discovery\_device\_id \<id\>**
 * **screen\_id**: The screen ID will be generated if not passed by -s flag. If you want to keep connected devices over restarts, generate it first and pass it from then on.
 * **lounge\_token, option\_sid, option\_gsessionid**: API internals
 

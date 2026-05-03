@@ -54,11 +54,13 @@ var (
 	debugLevel    int
 	debugLogPath  string
 	debugLogFile  *os.File
+	traceProtocol bool
 	screenId      string
 	screenName    string
 	screenApp     string
 	bindVals      url.Values
 	currentVolume string = "100"
+	currentMuted  bool   = false
 	ofs           uint64 = 0
 	playState     string = "3"
 	ctt           string
@@ -81,6 +83,7 @@ var (
 func init() {
 	flag.IntVar(&debugLevel, "d", 2, "Debug information level. 0 = off; 1 = full cmd info; 2 = timestamp prefix")
 	flag.StringVar(&debugLogPath, "debug-log-file", "gotubecast-debug.log", "Path to debug log file (used when -d >= 1)")
+	flag.BoolVar(&traceProtocol, "trace-protocol", false, "Trace incoming commands and outgoing bind responses in debug log")
 	flag.StringVar(&screenName, "n", defaultScreenName, "Display Name")
 	flag.StringVar(&screenApp, "i", defaultScreenApp, "Display App")
 	flag.StringVar(&screenId, "s", "", "Screen ID (will be generated if empty)")
@@ -261,6 +264,9 @@ func decodeBindStream(r io.Reader) (err error) {
 func genericCmd(index int64, cmd string, paramsList []interface{}) {
 	//debugInfo()
 	dbgPrintln(fmt.Sprintf("raw_cmd idx=%d cmd=%s params=%s", index, cmd, formatDebugParams(paramsList)))
+	if traceProtocol {
+		dbgPrintln(fmt.Sprintf("proto_in idx=%d cmd=%s params=%s", index, cmd, formatDebugParams(paramsList)))
+	}
 	if currentCmdIndex > 0 && index <= currentCmdIndex {
 		dbgPrintln(fmt.Sprintf("skipping already seen cmd %d", index))
 		return
@@ -302,8 +308,9 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		}
 	case "setPlaylist":
 		data := paramsList[0].(map[string]interface{})
+		videoID := getMapString(data, "videoId")
 		dialStateMu.Lock()
-		curVideoId = data["videoId"].(string)
+		curVideoId = videoID
 		dialStateMu.Unlock()
 		/*
 		curListId = data["listId"].(string)
@@ -337,7 +344,34 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		}
 
 		*/
-		msgPrintln(fmt.Sprint("video_id ", curVideoId))
+		if curVideoId != "" {
+			msgPrintln(fmt.Sprint("video_id ", curVideoId))
+		}
+	case "addVideo":
+		data := paramsList[0].(map[string]interface{})
+		videoId, _ := data["videoId"].(string)
+		if videoId != "" {
+			dialStateMu.Lock()
+			curVideoId = videoId
+			dialStateMu.Unlock()
+			msgPrintln(fmt.Sprint("video_id ", videoId))
+		}
+	case "updatePlaylist", "playlistModified":
+		if len(paramsList) > 0 {
+			data, ok := paramsList[0].(map[string]interface{})
+			if ok {
+				videoId := getMapString(data, "videoId")
+				if videoId == "" {
+					videoId = getMapString(data, "firstVideoId")
+				}
+				if videoId != "" {
+					dialStateMu.Lock()
+					curVideoId = videoId
+					dialStateMu.Unlock()
+					msgPrintln(fmt.Sprint("video_id ", videoId))
+				}
+			}
+		}
 		/*
 		postBind("nowPlaying", map[string]string{
 			"videoId":      curVideoId,
@@ -395,12 +429,21 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 			"cpn":         "foo",
 		})
 	case "getVolume":
-		postBind("onVolumeChanged", map[string]string{"volume": currentVolume, "muted": "false"})
+		postBind("onVolumeChanged", map[string]string{"volume": currentVolume, "muted": strconv.FormatBool(currentMuted)})
 	case "setVolume":
 		data := paramsList[0].(map[string]interface{})
 		currentVolume = data["volume"].(string)
+		currentMuted = false
 		msgPrintln(fmt.Sprint("set_volume ", currentVolume))
-		postBind("onVolumeChanged", map[string]string{"volume": currentVolume, "muted": "false"})
+		postBind("onVolumeChanged", map[string]string{"volume": currentVolume, "muted": strconv.FormatBool(currentMuted)})
+	case "mute":
+		currentMuted = true
+		msgPrintln("mute")
+		postBind("onVolumeChanged", map[string]string{"volume": currentVolume, "muted": strconv.FormatBool(currentMuted)})
+	case "unmute", "unMute":
+		currentMuted = false
+		msgPrintln("unmute")
+		postBind("onVolumeChanged", map[string]string{"volume": currentVolume, "muted": strconv.FormatBool(currentMuted)})
 	case "seekTo":
 		data := paramsList[0].(map[string]interface{})
 		newTime := data["newTime"].(string)
@@ -420,8 +463,13 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 			"cpn":         "foo",
 		})
 	case "stopVideo":
+		dialStateMu.Lock()
+		curVideoId = ""
+		dialStateMu.Unlock()
 		msgPrintln("stop")
 		postBind("nowPlaying", map[string]string{})
+	case "skipAd":
+		msgPrintln("skip_ad")
 	case "setSubtitlesTrack":
 		data := paramsList[0].(map[string]interface{})
 		langCode, _ := data["languageCode"].(string)
@@ -438,6 +486,51 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		}
 	case "onUserActivity":
 		msgPrintln("user_action")
+	case "getDiscoveryDeviceId":
+		msgPrintln(fmt.Sprint("discovery_device_id ", screenUid))
+		postBind("discoveryDeviceId", map[string]string{"deviceId": screenUid})
+	case "setAutoplayMode":
+		if len(paramsList) > 0 {
+			if data, ok := paramsList[0].(map[string]interface{}); ok {
+				mode := getMapString(data, "autoplayMode")
+				if mode != "" {
+					msgPrintln(fmt.Sprint("set_autoplay_mode ", mode))
+				}
+			}
+		}
+	case "setAudioTrack":
+		if len(paramsList) > 0 {
+			if data, ok := paramsList[0].(map[string]interface{}); ok {
+				id := getMapString(data, "id")
+				lang := getMapString(data, "languageCode")
+				if id != "" || lang != "" {
+					msgPrintln(fmt.Sprintf("set_audio_track %s %s", id, lang))
+				}
+			}
+		}
+	case "setPlaybackQuality":
+		if len(paramsList) > 0 {
+			if data, ok := paramsList[0].(map[string]interface{}); ok {
+				quality := getMapString(data, "quality")
+				if quality != "" {
+					msgPrintln(fmt.Sprint("set_playback_quality ", quality))
+				}
+			}
+		}
+	case "setPlaybackRate":
+		if len(paramsList) > 0 {
+			if data, ok := paramsList[0].(map[string]interface{}); ok {
+				rate := getMapString(data, "rate")
+				if rate != "" {
+					msgPrintln(fmt.Sprint("set_playback_rate ", rate))
+				}
+			}
+		}
+	case "onSubtitlesTrackChanged", "onAudioTrackChanged", "onAutoplayModeChanged",
+		"onHasPreviousNextChanged", "onVideoQualityChanged", "onVolumeChanged",
+		"onPlaylistModeChanged", "autoplayUpNext", "adPlaying", "onAdStateChange",
+		"loungeScreenDisconnected":
+		msgPrintln(fmt.Sprintf("event %s %s", cmd, formatDebugParams(paramsList)))
 	case "next":
 		msgPrintln("next")
 		if curIndex+1 < len(curList) {
@@ -500,6 +593,21 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 	*/
 }
 
+func getMapString(data map[string]interface{}, key string) string {
+	if data == nil {
+		return ""
+	}
+	v, ok := data[key]
+	if !ok || v == nil {
+		return ""
+	}
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+	return s
+}
+
 func postBind(sc string, params map[string]string) {
 	ofs++
 	postVals := url.Values{"count": {"1"}, "ofs": {fmt.Sprintf("%v", ofs)}}
@@ -508,11 +616,22 @@ func postBind(sc string, params map[string]string) {
 		postVals["req0_"+k] = []string{v}
 	}
 	bindVals["RID"] = []string{"1337"}
+	if traceProtocol {
+		dbgPrintln(fmt.Sprintf("proto_out sc=%s params=%s", sc, formatURLValues(postVals)))
+	}
 	resp, err := http.PostForm("https://www.youtube.com/api/lounge/bc/bind?"+bindVals.Encode(), postVals)
 	if err != nil {
 		panic(err)
 	}
+	body, readErr := ioutil.ReadAll(resp.Body)
 	resp.Body.Close()
+	if traceProtocol {
+		if readErr != nil {
+			dbgPrintln(fmt.Sprintf("proto_resp sc=%s status=%d read_err=%v", sc, resp.StatusCode, readErr))
+		} else {
+			dbgPrintln(fmt.Sprintf("proto_resp sc=%s status=%d body=%s", sc, resp.StatusCode, sanitizeLogBody(string(body))))
+		}
+	}
 }
 
 func debugInfo() {
@@ -631,4 +750,33 @@ func parseEmbeddedJSON(s string) (interface{}, bool) {
 	}
 
 	return parsed, true
+}
+
+func formatURLValues(vals url.Values) string {
+	plain := make(map[string]interface{}, len(vals))
+	for key, list := range vals {
+		switch len(list) {
+		case 0:
+			plain[key] = ""
+		case 1:
+			plain[key] = list[0]
+		default:
+			multi := make([]string, len(list))
+			copy(multi, list)
+			plain[key] = multi
+		}
+	}
+	body, err := json.Marshal(plain)
+	if err != nil {
+		return fmt.Sprintf("%v", vals)
+	}
+	return string(body)
+}
+
+func sanitizeLogBody(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return "\"\""
+	}
+	return trimmed
 }
