@@ -14,6 +14,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	//"strings"
 	"sync"
@@ -51,6 +52,8 @@ const (
 
 var (
 	debugLevel    int
+	debugLogPath  string
+	debugLogFile  *os.File
 	screenId      string
 	screenName    string
 	screenApp     string
@@ -77,6 +80,7 @@ var (
 
 func init() {
 	flag.IntVar(&debugLevel, "d", 2, "Debug information level. 0 = off; 1 = full cmd info; 2 = timestamp prefix")
+	flag.StringVar(&debugLogPath, "debug-log-file", "gotubecast-debug.log", "Path to debug log file (used when -d >= 1)")
 	flag.StringVar(&screenName, "n", defaultScreenName, "Display Name")
 	flag.StringVar(&screenApp, "i", defaultScreenApp, "Display App")
 	flag.StringVar(&screenId, "s", "", "Screen ID (will be generated if empty)")
@@ -84,6 +88,18 @@ func init() {
 
 func main() {
 	flag.Parse()
+	defer func() {
+		if debugLogFile != nil {
+			debugLogFile.Close()
+		}
+	}()
+	if debugLevel >= 1 {
+		file, err := os.OpenFile(debugLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			panic(fmt.Sprintf("failed to open debug log file %q: %v", debugLogPath, err))
+		}
+		debugLogFile = file
+	}
 	// screen id:
 	if screenId == "" {
 		resp, err := http.Get("https://www.youtube.com/api/lounge/pairing/generate_screen_id")
@@ -271,7 +287,7 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		id := data["id"].(string)
 		msgPrintln(fmt.Sprint("remote_leave ", id))
 	case "getNowPlaying":
-		curTime = time.Now().Sub(startTime)
+		curTime = time.Since(startTime)
 		if curVideoId == "" {
 			postBind("nowPlaying", map[string]string{})
 		} else {
@@ -371,7 +387,7 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 	case "pause":
 		msgPrintln("pause")
 		playState = "2"
-		curTime = time.Now().Sub(startTime)
+		curTime = time.Since(startTime)
 		postBind("onStateChange", map[string]string{
 			"currentTime": fmt.Sprintf("%.3f", curTime.Seconds()),
 			"state":       "2",
@@ -550,10 +566,15 @@ func msgPrintln(line string) {
 
 func dbgPrintln(line string) {
 	if debugLevel >= 1 {
+		if debugLogFile == nil {
+			return
+		}
+		printLock.Lock()
+		defer printLock.Unlock()
 		if debugLevel >= 2 {
-			msgPrintln(fmt.Sprint("dbg ", time.Now().Format(timefmt), " ", line))
+			fmt.Fprintln(debugLogFile, fmt.Sprint("dbg ", time.Now().Format(timefmt), " ", line))
 		} else {
-			msgPrintln(fmt.Sprint("dbg ", line))
+			fmt.Fprintln(debugLogFile, fmt.Sprint("dbg ", line))
 		}
 	}
 }

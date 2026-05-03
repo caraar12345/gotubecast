@@ -22,6 +22,8 @@ Configuration (environment variables):
     SCREEN_APP      App identifier                           (default: gotubecast-pi-v1)
     SCREEN_ID       Persistent screen ID (leave blank to auto-generate)
     DIAL_PORT       DIAL HTTP server port                    (default: 8008)
+    GTC_DEBUG_LEVEL gotubecast debug level                   (default: 2)
+    GTC_DEBUG_LOG   gotubecast debug log file path           (default: $XDG_RUNTIME_DIR/gotubecast/gotubecast-debug.log)
     SUB_LANG        Subtitle language code, e.g. "en"        (default: en, blank to disable)
     VIDEO_QUALITY   Maximum video height in pixels           (default: 1080)
     MPV_OPTS        Extra mpv CLI options (space-separated)
@@ -47,6 +49,7 @@ SCREEN_NAME   = os.environ.get("SCREEN_NAME",   "GoTubeCast Pi")
 SCREEN_APP    = os.environ.get("SCREEN_APP",    "gotubecast-pi-v1")
 SCREEN_ID     = os.environ.get("SCREEN_ID",     "")
 DIAL_PORT     = int(os.environ.get("DIAL_PORT", "8008"))
+GTC_DEBUG_LEVEL = os.environ.get("GTC_DEBUG_LEVEL", "2")
 SUB_LANG      = os.environ.get("SUB_LANG",      "en")
 VIDEO_QUALITY = os.environ.get("VIDEO_QUALITY", "1080")
 MPV_EXTRA     = os.environ.get("MPV_OPTS",      "").split()
@@ -61,6 +64,9 @@ RUNTIME_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
 
 MPV_SOCKET = str(RUNTIME_DIR / "mpv.sock")
 TEMP_DIR   = RUNTIME_DIR / "downloads"
+GTC_DEBUG_LOG = os.environ.get(
+    "GTC_DEBUG_LOG", str(RUNTIME_DIR / "gotubecast-debug.log")
+)
 
 # ---------------------------------------------------------------------------
 # State
@@ -344,7 +350,9 @@ def main() -> None:
         "gotubecast",
         "-n", SCREEN_NAME,
         "-i", SCREEN_APP,
-        "-p", str(DIAL_PORT)
+        "-p", str(DIAL_PORT),
+        "-d", GTC_DEBUG_LEVEL,
+        "-debug-log-file", GTC_DEBUG_LOG,
     ]
     if SCREEN_ID:
         gtc_cmd.extend(["-s", SCREEN_ID])

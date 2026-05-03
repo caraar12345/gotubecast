@@ -40,7 +40,9 @@ Usage help:
 	$ gotubecast -h
 	Usage of ./gotubecast:
 	  -d int
-			Debug information level. 0 = off; 1 = full cmd info; 2 = timestamp prefix, this changes the output format!
+			Debug information level. 0 = off; 1 = full cmd info; 2 = timestamp prefix (debug logs go to file)
+	  -debug-log-file string
+			Path to debug log file (used when -d >= 1) (default "gotubecast-debug.log")
 	  -i string
 			Display App (default "golang-test-838")
 	  -n string
