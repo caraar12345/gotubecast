@@ -134,11 +134,11 @@ fi
 echo ">>> Building gotubecast..."
 mkdir -p "${HOME}/.local/bin"
 if command -v go &>/dev/null; then
-    go build -C "${REPO_DIR}" -o "${HOME}/.local/bin/gotubecast" .
+    (cd "${REPO_DIR}" && go build -o "${HOME}/.local/bin/gotubecast" .)
     echo "    Installed to ~/.local/bin/gotubecast"
 else
     echo "    WARNING: go not found — skipping build. Install Go then run:"
-    echo "    go build -C ${REPO_DIR} -o ~/.local/bin/gotubecast ."
+    echo "    cd ${REPO_DIR} && go build -o ~/.local/bin/gotubecast ."
 fi
 
 # ── cast.py ───────────────────────────────────────────────────────────────────
