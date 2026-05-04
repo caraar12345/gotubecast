@@ -282,13 +282,27 @@ func decodeBindStream(r io.Reader) (err error) {
 				if err != nil {
 					return
 				}
+				if len(indexedCmd) < 2 {
+					continue
+				}
+				idxNum, ok := indexedCmd[0].(json.Number)
+				if !ok {
+					continue
+				}
 				var index int64
-				index, err = indexedCmd[0].(json.Number).Int64()
+				index, err = idxNum.Int64()
 				if err != nil {
 					return
 				}
-				cmdArray := indexedCmd[1].([]interface{})
-				genericCmd(index, cmdArray[0].(string), cmdArray[1:])
+				cmdArray, ok := indexedCmd[1].([]interface{})
+				if !ok || len(cmdArray) == 0 {
+					continue
+				}
+				cmdName, ok := cmdArray[0].(string)
+				if !ok {
+					continue
+				}
+				genericCmd(index, cmdName, cmdArray[1:])
 			}
 			// closing ]:
 			dec.Token()

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: UP007  # keep Optional[] for Python 3.9 compat (Raspberry Pi OS Bullseye)
 """
 cast.py — YouTube cast device integration for Raspberry Pi 5
 
@@ -43,6 +44,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -81,7 +83,7 @@ _mpv_proc = None
 _mpv_lock = threading.Lock()
 _play_generation     = 0   # incremented on each play_video(); guards stale fetches
 _subtitle_generation = 0   # incremented on each subtitle change; guards stale loads
-_active_video_id: str | None = None  # video currently tied to mpv; cleared between plays / on stop
+_active_video_id: Optional[str] = None  # video currently tied to mpv; cleared between plays / on stop
 
 # ---------------------------------------------------------------------------
 # mpv IPC
@@ -126,7 +128,7 @@ def mpv_get_property(name: str):
 
 def _playback_observer(gtc: subprocess.Popen) -> None:
     """Push mpv pause/time-pos to gotubecast stdin so the Lounge client UI stays in sync."""
-    last_pause: bool | None = None
+    last_pause: Optional[bool] = None
     last_play_generation = 0
     while gtc.poll() is None:
         time.sleep(0.25)
@@ -193,7 +195,7 @@ def get_stream_urls(video_id: str) -> list:
     return [u for u in r.stdout.strip().splitlines() if u]
 
 
-def fetch_subtitles(video_id: str, lang: str) -> Path | None:
+def fetch_subtitles(video_id: str, lang: str) -> Optional[Path]:
     """Download the subtitle file for video_id / lang into TEMP_DIR.
 
     Prefers manual captions; falls back to auto-generated ones.
