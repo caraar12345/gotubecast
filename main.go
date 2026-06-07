@@ -7,6 +7,10 @@ package main
 // keep player state, devices etc.
 
 import (
+	"bufio"
+	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -14,9 +18,12 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"os"
+	"regexp"
 	"strconv"
-	//"strings"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -50,15 +57,21 @@ const (
 )
 
 var (
-	debugLevel    int
-	screenId      string
-	screenName    string
-	screenApp     string
-	bindVals      url.Values
-	currentVolume string = "100"
-	ofs           uint64 = 0
-	playState     string = "3"
-	ctt           string
+	debugLevel      int
+	debugLogPath    string
+	debugRootCAPath string
+	debugLogFile    *os.File
+	traceProtocol   bool
+	screenId        string
+	screenName      string
+	screenApp       string
+	screenTheme     string
+	bindVals        url.Values
+	currentVolume   string = "100"
+	currentMuted    bool   = false
+	ofs             uint64 // lounge bind sequence; updated with atomic.AddUint64
+	playState       string = "3"
+	ctt             string
 	//playTimer     *time.Timer
 	currentCmdIndex int64
 
@@ -73,35 +86,77 @@ var (
 	curIndex      int
 	curListVideos []Video
 	printLock     sync.Mutex
+	playbackMu    sync.Mutex
+	postBindMu    sync.Mutex
+	loungeCPN     string // Client Playback Nonce; refreshed per video for Lounge bind
+
+	connectedRemotes   = map[string]string{} // remote id → display name
+	connectedRemotesMu sync.Mutex
+	pendingStopTimer   *time.Timer // debounces stop-on-disconnect; guarded by connectedRemotesMu
+)
+
+// remoteDisconnectGrace is how long to wait after the last remote disconnects
+// before stopping playback. The Lounge protocol emits transient
+// remoteDisconnected/remoteConnected churn during normal operation (the phone
+// briefly drops and re-establishes its bind session every few seconds), so we
+// only stop if no remote has reconnected within this window.
+const remoteDisconnectGrace = 8 * time.Second
+
+// YouTube watch HTML embeds duration in player response JSON.
+var (
+	reYouTubeLengthQuoted = regexp.MustCompile(`"lengthSeconds":"(\d+)"`)
+	reYouTubeLengthBare   = regexp.MustCompile(`"lengthSeconds":(\d+)`)
+	reYouTubeApproxMs     = regexp.MustCompile(`"approxDurationMs":"(\d+)"`)
 )
 
 func init() {
-	flag.IntVar(&debugLevel, "d", 0, "Debug information level. 0 = off; 1 = full cmd info; 2 = timestamp prefix")
+	flag.IntVar(&debugLevel, "d", 2, "Debug information level. 0 = off; 1 = full cmd info; 2 = timestamp prefix")
+	flag.StringVar(&debugLogPath, "debug-log-file", "gotubecast-debug.log", "Path to debug log file (used when -d >= 1)")
+	flag.StringVar(&debugRootCAPath, "debug-root-ca", "", "Path to PEM file with extra root CA(s) for outbound HTTPS (e.g. TLS-inspecting proxy); system roots are kept")
+	flag.BoolVar(&traceProtocol, "trace-protocol", false, "Trace incoming commands and outgoing bind responses in debug log")
 	flag.StringVar(&screenName, "n", defaultScreenName, "Display Name")
 	flag.StringVar(&screenApp, "i", defaultScreenApp, "Display App")
+	flag.StringVar(&screenTheme, "theme", "cl", "Lounge theme: cl=YouTube, ytm=YouTube Music")
 	flag.StringVar(&screenId, "s", "", "Screen ID (will be generated if empty)")
 }
 
 func main() {
 	flag.Parse()
+	loungeCPN = newLoungeCPN()
+	go readStdinPlayback()
+	if err := initOutboundHTTP(debugRootCAPath); err != nil {
+		panic(err)
+	}
+	defer func() {
+		if debugLogFile != nil {
+			debugLogFile.Close()
+		}
+	}()
+	if debugLevel >= 1 {
+		file, err := os.OpenFile(debugLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			panic(fmt.Sprintf("failed to open debug log file %q: %v", debugLogPath, err))
+		}
+		debugLogFile = file
+		_ = os.Chmod(debugLogPath, 0600)
+	}
 	// screen id:
 	if screenId == "" {
-		resp, err := http.Get("https://www.youtube.com/api/lounge/pairing/generate_screen_id")
+		resp, err := outboundHTTP.Get("https://www.youtube.com/api/lounge/pairing/generate_screen_id")
 		if err != nil {
 			panic(err)
-			return
 		}
 		defer resp.Body.Close()
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
 			panic(err)
 		}
-		screenId = string(body)
+		screenId = strings.TrimSpace(string(body))
 	}
 	msgPrintln(fmt.Sprint("screen_id ", screenId))
 
 	// lounge token:
-	resp, err := http.PostForm("https://www.youtube.com/api/lounge/pairing/get_lounge_token_batch", url.Values{"screen_ids": {screenId}})
+	resp, err := outboundHTTP.PostForm("https://www.youtube.com/api/lounge/pairing/get_lounge_token_batch", url.Values{"screen_ids": {screenId}})
 	if err != nil {
 		panic(err)
 	}
@@ -115,16 +170,22 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	if len(tokenObj.Screens) == 0 {
+		panic("get_lounge_token_batch returned no screens")
+	}
 	tokenScreenItem := tokenObj.Screens[0]
+	currentLoungeToken = tokenScreenItem.LoungeToken
 	msgPrintln(fmt.Sprint("lounge_token ", tokenScreenItem.LoungeToken, " ", tokenScreenItem.Expiration/1000))
 
 	bindVals = url.Values{
-		"device":        {"LOUNGE_SCREEN"},
-		"id":            {screenUid},
-		"name":          {screenName},
-		"app":           {screenApp},
-		"theme":         {"cl"},
-		"capabilities":  {},
+		"device": {"LOUNGE_SCREEN"},
+		"id":     {screenUid},
+		"name":   {screenName},
+		"app":    {screenApp},
+		"theme":  {screenTheme},
+		// Must be non-empty: url.Values with an empty slice omits the key entirely,
+		// and YouTube will not send cast/playlist commands to a receiver with no caps.
+		"capabilities":  {"que,mus"},
 		"mdx-version":   {"2"},
 		"loungeIdToken": {tokenScreenItem.LoungeToken},
 		"VER":           {"8"},
@@ -136,17 +197,20 @@ func main() {
 	}
 
 	// bind 1
-	resp, err = http.PostForm("https://www.youtube.com/api/lounge/bc/bind?"+bindVals.Encode(), url.Values{"count": {"0"}})
+	resp, err = outboundHTTP.PostForm("https://www.youtube.com/api/lounge/bc/bind?"+bindVals.Encode(), url.Values{"count": {"0"}})
 	if err != nil {
 		panic(err)
 	}
 	defer resp.Body.Close()
 	decodeBindStream(resp.Body)
 
+	// DIAL server (device discovery + YouTube app endpoint):
+	startDIAL()
+
 	// pairing code every 5 minutes:
 	go func() {
 		for {
-			resp, err = http.PostForm("https://www.youtube.com/api/lounge/pairing/get_pairing_code?ctx=pair", url.Values{
+			resp, err = outboundHTTP.PostForm("https://www.youtube.com/api/lounge/pairing/get_pairing_code?ctx=pair", url.Values{
 				"access_type":  {"permanent"},
 				"app":          {screenApp},
 				"lounge_token": {tokenScreenItem.LoungeToken},
@@ -178,11 +242,18 @@ func main() {
 			msgPrintln(fmt.Sprintf("error reached %d errors, terminating...", errCount))
 			return
 		}
-		ofs++
-		bindValsGet := bindVals
+		atomic.AddUint64(&ofs, 1)
+		// Must clone: bindVals is a map; `bindValsGet := bindVals` aliases the same map,
+		// so assigning RID/CI would corrupt long-lived POST state (CI leaked onto every
+		// postBind URL and broke remote/playlist delivery).
+		postBindMu.Lock()
+		bindValsGet := cloneURLValues(bindVals)
+		postBindMu.Unlock()
 		bindValsGet["RID"] = []string{"rpc"}
 		bindValsGet["CI"] = []string{"0"}
-		resp, err = http.Get("https://www.youtube.com/api/lounge/bc/bind?" + bindValsGet.Encode())
+		bindValsGet["TYPE"] = []string{"xmlhttp"}
+		bindValsGet["AID"] = []string{strconv.FormatInt(currentCmdIndex, 10)}
+		resp, err = outboundHTTP.Get("https://www.youtube.com/api/lounge/bc/bind?" + bindValsGet.Encode())
 		if err != nil {
 			errCount++
 			msgPrintln(fmt.Sprint("error ", err.Error()))
@@ -224,25 +295,268 @@ func decodeBindStream(r io.Reader) (err error) {
 				if err != nil {
 					return
 				}
+				if len(indexedCmd) < 2 {
+					continue
+				}
+				idxNum, ok := indexedCmd[0].(json.Number)
+				if !ok {
+					continue
+				}
 				var index int64
-				index, err = indexedCmd[0].(json.Number).Int64()
+				index, err = idxNum.Int64()
 				if err != nil {
 					return
 				}
-				cmdArray := indexedCmd[1].([]interface{})
-				genericCmd(index, cmdArray[0].(string), cmdArray[1:])
+				cmdArray, ok := indexedCmd[1].([]interface{})
+				if !ok || len(cmdArray) == 0 {
+					continue
+				}
+				cmdName, ok := cmdArray[0].(string)
+				if !ok {
+					continue
+				}
+				genericCmd(index, cmdName, cmdArray[1:])
 			}
 			// closing ]:
 			dec.Token()
 		}
 	}
-	return
+}
+
+func postBindOnStateChangeEmit() {
+	playbackMu.Lock()
+	curTimeSnap := curTime
+	if playState == "1" {
+		curTimeSnap = time.Since(startTime)
+	}
+	stateSnap := playState
+	cpnSnap := loungeCPN
+	playbackMu.Unlock()
+
+	dialStateMu.RLock()
+	dur := curVideo.Length
+	dialStateMu.RUnlock()
+
+	postBind("onStateChange", map[string]string{
+		"currentTime": fmt.Sprintf("%.3f", curTimeSnap.Seconds()),
+		"state":       stateSnap,
+		"duration":    strconv.Itoa(dur),
+		"cpn":         cpnSnap,
+	})
+}
+
+func newLoungeCPN() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "gtc-fallback-cpn"
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:])
+}
+
+func parseYouTubeWatchBodyForDuration(body []byte, videoID, source string) int {
+	if len(body) == 0 {
+		return 0
+	}
+	if m := reYouTubeLengthQuoted.FindSubmatch(body); len(m) >= 2 {
+		if n, err := strconv.Atoi(string(m[1])); err == nil && n > 0 {
+			dbgPrintln(fmt.Sprintf("video_meta lengthSeconds=%d id=%s src=%s", n, videoID, source))
+			return n
+		}
+	}
+	if m := reYouTubeLengthBare.FindSubmatch(body); len(m) >= 2 {
+		if n, err := strconv.Atoi(string(m[1])); err == nil && n > 0 {
+			dbgPrintln(fmt.Sprintf("video_meta lengthSeconds(bare)=%d id=%s src=%s", n, videoID, source))
+			return n
+		}
+	}
+	if m := reYouTubeApproxMs.FindSubmatch(body); len(m) >= 2 {
+		if ms, err := strconv.ParseInt(string(m[1]), 10, 64); err == nil && ms > 0 {
+			sec := int(ms / 1000)
+			if sec > 0 {
+				dbgPrintln(fmt.Sprintf("video_meta approxDurationSec=%d id=%s src=%s", sec, videoID, source))
+				return sec
+			}
+		}
+	}
+	return 0
+}
+
+func fetchVideoLengthSeconds(ctx context.Context, videoID string) int {
+	if videoID == "" {
+		return 0
+	}
+	pageURLs := []struct {
+		url    string
+		source string
+	}{
+		{"https://www.youtube.com/watch?v=" + url.QueryEscape(videoID), "www"},
+		{"https://m.youtube.com/watch?v=" + url.QueryEscape(videoID), "m"},
+	}
+	for _, p := range pageURLs {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		resp, err := outboundHTTP.Do(req)
+		if err != nil {
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			continue
+		}
+		body, err := ioutil.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		if n := parseYouTubeWatchBodyForDuration(body, videoID, p.source); n > 0 {
+			return n
+		}
+	}
+	dbgPrintln(fmt.Sprintf("video_meta duration_not_found id=%s", videoID))
+	return 0
+}
+
+// postBindNowPlayingFromGlobals pushes queue position + state so the remote can sync UI.
+func postBindNowPlayingFromGlobals() {
+	playbackMu.Lock()
+	if playState == "1" {
+		curTime = time.Since(startTime)
+	}
+	curTimeSnap := curTime
+	ps := playState
+	playbackMu.Unlock()
+
+	dialStateMu.RLock()
+	vid := curVideoId
+	lid := curListId
+	ct := ctt
+	idx := curIndex
+	dialStateMu.RUnlock()
+	if vid == "" {
+		return
+	}
+	postBind("nowPlaying", map[string]string{
+		"videoId":      vid,
+		"currentTime":  fmt.Sprintf("%.3f", curTimeSnap.Seconds()),
+		"ctt":          ct,
+		"listId":       lid,
+		"currentIndex": strconv.Itoa(idx),
+		"state":        ps,
+	})
+}
+
+// loungeEmitAt applies playback position/state from the local player (stdin: playback_notify).
+func loungeEmitAt(state string, posSec float64) {
+	if state != "1" && state != "2" {
+		return
+	}
+	playbackMu.Lock()
+	playState = state
+	curTime = time.Duration(posSec * float64(time.Second))
+	if state == "1" {
+		startTime = time.Now().Add(-curTime)
+	}
+	playbackMu.Unlock()
+	postBindOnStateChangeEmit()
+	postBindNowPlayingFromGlobals()
+	dbgPrintln(fmt.Sprintf("stdin playback_notify state=%s time=%.3f", state, posSec))
+}
+
+// stopCurrentVideo clears playback state and notifies the Lounge API that nothing is playing.
+// Safe to call when nothing is playing (no-op if curVideoId is already empty).
+func stopCurrentVideo() {
+	dialStateMu.Lock()
+	if curVideoId == "" {
+		dialStateMu.Unlock()
+		return
+	}
+	curVideoId = ""
+	curVideo = Video{}
+	dialStateMu.Unlock()
+
+	playbackMu.Lock()
+	playState = "3"
+	curTime = 0
+	playbackMu.Unlock()
+
+	msgPrintln("stop")
+	postBind("nowPlaying", map[string]string{})
+}
+
+// applySetPlaylistPlaybackState mirrors mobile playbackState into the Lounge bind stream.
+// YouTube iOS often sends play/pause only via setPlaylist, not discrete play/pause RPCs.
+func applySetPlaylistPlaybackState(playbackState, currentTimeStr string, notifyPlayer bool) {
+	ps := strings.ToUpper(strings.TrimSpace(playbackState))
+	if ps != "PLAYING" && ps != "PAUSED" {
+		return
+	}
+	playbackMu.Lock()
+	if currentTimeStr != "" {
+		if d, err := time.ParseDuration(currentTimeStr + "s"); err == nil {
+			curTime = d
+		}
+	} else if playState == "1" {
+		curTime = time.Since(startTime)
+	}
+	if ps == "PLAYING" {
+		playState = "1"
+		startTime = time.Now().Add(-curTime)
+	} else {
+		playState = "2"
+	}
+	playbackMu.Unlock()
+
+	postBindNowPlayingFromGlobals()
+
+	postBindOnStateChangeEmit()
+
+	if notifyPlayer {
+		if ps == "PLAYING" {
+			msgPrintln("play")
+		} else {
+			msgPrintln("pause")
+		}
+	}
+}
+
+func readStdinPlayback() {
+	sc := bufio.NewScanner(os.Stdin)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 1 && fields[0] == "playback_ended" {
+			stopCurrentVideo()
+			continue
+		}
+		if len(fields) != 3 || fields[0] != "playback_notify" {
+			continue
+		}
+		st := fields[1]
+		if st != "1" && st != "2" {
+			continue
+		}
+		posSec, err := strconv.ParseFloat(fields[2], 64)
+		if err != nil || posSec < 0 {
+			continue
+		}
+		loungeEmitAt(st, posSec)
+	}
 }
 
 // genericCmd interpretes and executes commands from the bind stream
 func genericCmd(index int64, cmd string, paramsList []interface{}) {
 	//debugInfo()
-	dbgPrintln(fmt.Sprintf("raw_cmd %v %v %#v", index, cmd, paramsList))
+	dbgPrintln(fmt.Sprintf("raw_cmd idx=%d cmd=%s params=%s", index, cmd, formatDebugParams(paramsList)))
+	if traceProtocol {
+		dbgPrintln(fmt.Sprintf("proto_in idx=%d cmd=%s params=%s", index, cmd, formatDebugParams(paramsList)))
+	}
 	if currentCmdIndex > 0 && index <= currentCmdIndex {
 		dbgPrintln(fmt.Sprintf("skipping already seen cmd %d", index))
 		return
@@ -253,91 +567,202 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		//msgPrintln("noop")
 	case "c":
 		sid := paramsList[0].(string)
+		postBindMu.Lock()
 		bindVals["SID"] = []string{sid}
+		postBindMu.Unlock()
 		msgPrintln(fmt.Sprint("option_sid ", sid))
 	case "S":
 		gsessionid := paramsList[0].(string)
+		postBindMu.Lock()
 		bindVals["gsessionid"] = []string{gsessionid}
+		postBindMu.Unlock()
 		msgPrintln(fmt.Sprint("option_gsessionid ", gsessionid))
 	case "remoteConnected":
 		data := paramsList[0].(map[string]interface{})
 		id := data["id"].(string)
 		name := data["name"].(string)
+		connectedRemotesMu.Lock()
+		connectedRemotes[id] = name
+		// A remote (re)connected: cancel any pending stop from a transient drop.
+		if pendingStopTimer != nil {
+			pendingStopTimer.Stop()
+			pendingStopTimer = nil
+		}
+		connectedRemotesMu.Unlock()
 		msgPrintln(fmt.Sprint("remote_join ", id, " ", name))
 	case "remoteDisconnected":
 		data := paramsList[0].(map[string]interface{})
 		id := data["id"].(string)
+		connectedRemotesMu.Lock()
+		delete(connectedRemotes, id)
+		// Debounce: only stop if no remote reconnects within the grace window.
+		// remoteDisconnected fires transiently during normal Lounge operation.
+		if len(connectedRemotes) == 0 {
+			if pendingStopTimer != nil {
+				pendingStopTimer.Stop()
+			}
+			pendingStopTimer = time.AfterFunc(remoteDisconnectGrace, func() {
+				connectedRemotesMu.Lock()
+				stillEmpty := len(connectedRemotes) == 0
+				pendingStopTimer = nil
+				connectedRemotesMu.Unlock()
+				if stillEmpty {
+					stopCurrentVideo()
+				}
+			})
+		}
+		connectedRemotesMu.Unlock()
 		msgPrintln(fmt.Sprint("remote_leave ", id))
 	case "getNowPlaying":
-		curTime = time.Now().Sub(startTime)
-		if curVideoId == "" {
+		playbackMu.Lock()
+		if playState == "1" {
+			curTime = time.Since(startTime)
+		}
+		curTimeSnap := curTime
+		playStateSnap := playState
+		playbackMu.Unlock()
+		dialStateMu.RLock()
+		videoIDNow := curVideoId
+		dialStateMu.RUnlock()
+		if videoIDNow == "" {
 			postBind("nowPlaying", map[string]string{})
 		} else {
 			postBind("nowPlaying", map[string]string{
-				"videoId":      curVideoId,
-				"currentTime":  fmt.Sprintf("%.3f", curTime.Seconds()),
+				"videoId":      videoIDNow,
+				"currentTime":  fmt.Sprintf("%.3f", curTimeSnap.Seconds()),
 				"ctt":          ctt,
 				"listId":       curListId,
 				"currentIndex": strconv.Itoa(curIndex),
-				"state":        playState,
+				"state":        playStateSnap,
 			})
 		}
 	case "setPlaylist":
 		data := paramsList[0].(map[string]interface{})
-		curVideoId = data["videoId"].(string)
-		/*
-		curListId = data["listId"].(string)
-		info := getListInfo(curListId)
-		curListVideos = info.Video
-		currentTime := ""
-		if data["currentTime"] != nil {
-			currentTime = data["currentTime"].(string)
+		videoID := getMapString(data, "videoId")
+		if lid := getMapString(data, "listId"); lid != "" {
+			curListId = lid
 		}
-		videoIds := data["videoIds"].(string)
-		curList = strings.Split(videoIds, ",")
-		curVideo = curListVideos[0]
-		if data["currentIndex"] != nil {
-			curIndex, err := strconv.Atoi(data["currentIndex"].(string))
-			if err == nil {
-				curVideo = curListVideos[curIndex]
+		if vids := getMapString(data, "videoIds"); vids != "" {
+			curList = strings.Split(vids, ",")
+		}
+		if idxStr := getMapString(data, "currentIndex"); idxStr != "" {
+			if idx, err := strconv.Atoi(idxStr); err == nil {
+				curIndex = idx
 			}
 		}
+		if c := getMapString(data, "ctt"); c != "" {
+			ctt = c
+		}
+		if videoID != "" {
+			dialStateMu.RLock()
+			prevID := curVideoId
+			prevLen := curVideo.Length
+			dialStateMu.RUnlock()
+			dur := prevLen
+			if prevID != videoID || dur <= 0 {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				dur = fetchVideoLengthSeconds(ctx, videoID)
+				cancel()
+			}
+			dialStateMu.Lock()
+			curVideoId = videoID
+			curVideo = Video{Id: videoID, Length: dur}
+			dialStateMu.Unlock()
+			playbackMu.Lock()
+			loungeCPN = newLoungeCPN()
+			playbackMu.Unlock()
+		} else {
+			dialStateMu.Lock()
+			curVideoId = ""
+			curVideo = Video{}
+			dialStateMu.Unlock()
+		}
+		/*
+			curListId = data["listId"].(string)
+			info := getListInfo(curListId)
+			curListVideos = info.Video
+			currentTime := ""
+			if data["currentTime"] != nil {
+				currentTime = data["currentTime"].(string)
+			}
+			videoIds := data["videoIds"].(string)
+			curList = strings.Split(videoIds, ",")
+			curVideo = curListVideos[0]
+			if data["currentIndex"] != nil {
+				curIndex, err := strconv.Atoi(data["currentIndex"].(string))
+				if err == nil {
+					curVideo = curListVideos[curIndex]
+				}
+			}
 
-		// set startTime:
-		currentTimeDuration, err := time.ParseDuration(currentTime + "s")
-		if err != nil {
-			currentTimeDuration = 0
-		}
-		curTime = currentTimeDuration
-		startTime = time.Now().Add(-curTime)
-		var ok bool
-		ctt, ok = data["ctt"].(string)
-		if !ok {
-			ctt = ""
-		}
+			// set startTime:
+			currentTimeDuration, err := time.ParseDuration(currentTime + "s")
+			if err != nil {
+				currentTimeDuration = 0
+			}
+			curTime = currentTimeDuration
+			startTime = time.Now().Add(-curTime)
+			var ok bool
+			ctt, ok = data["ctt"].(string)
+			if !ok {
+				ctt = ""
+			}
 
 		*/
-		msgPrintln(fmt.Sprint("video_id ", curVideoId))
+		if curVideoId != "" {
+			msgPrintln(fmt.Sprint("video_id ", curVideoId))
+		}
+		if ps := getMapString(data, "playbackState"); ps != "" {
+			applySetPlaylistPlaybackState(ps, getMapString(data, "currentTime"), true)
+		} else if curVideoId != "" {
+			postBindNowPlayingFromGlobals()
+			postBindOnStateChangeEmit()
+		}
+	case "addVideo":
+		data := paramsList[0].(map[string]interface{})
+		videoId, _ := data["videoId"].(string)
+		if videoId != "" {
+			dialStateMu.Lock()
+			curVideoId = videoId
+			dialStateMu.Unlock()
+			msgPrintln(fmt.Sprint("video_id ", videoId))
+		}
+	case "updatePlaylist", "playlistModified":
+		if len(paramsList) > 0 {
+			data, ok := paramsList[0].(map[string]interface{})
+			if ok {
+				videoId := getMapString(data, "videoId")
+				if videoId == "" {
+					videoId = getMapString(data, "firstVideoId")
+				}
+				if videoId != "" {
+					dialStateMu.Lock()
+					curVideoId = videoId
+					dialStateMu.Unlock()
+					msgPrintln(fmt.Sprint("video_id ", videoId))
+				}
+			}
+		}
 		/*
-		postBind("nowPlaying", map[string]string{
-			"videoId":      curVideoId,
-			"currentTime":  currentTime,
-			"ctt":          ctt,
-			"listId":       curListId,
-			"currentIndex": strconv.Itoa(curIndex),
-			"state":        "3",
-		})
-		playState = "1"
-		postBind("onStateChange", map[string]string{
-			"currentTime": currentTime,
-			"state":       "1",
-			"duration":    strconv.Itoa(curVideo.Length),
-			"cpn":         "foo",
-		})
+			postBind("nowPlaying", map[string]string{
+				"videoId":      curVideoId,
+				"currentTime":  currentTime,
+				"ctt":          ctt,
+				"listId":       curListId,
+				"currentIndex": strconv.Itoa(curIndex),
+				"state":        "3",
+			})
+			playState = "1"
+			postBind("onStateChange", map[string]string{
+				"currentTime": currentTime,
+				"state":       "1",
+				"duration":    strconv.Itoa(curVideo.Length),
+				"cpn":         "foo",
+			})
 		*/
 	// FIXME
 	//case "updatePlaylist":
-		/*
+	/*
 		data := paramsList[0].(map[string]interface{})
 		curListId = data["listId"].(string)
 		if data["videoIds"] != nil {
@@ -353,34 +778,39 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		}
 		info := getListInfo(curListId)
 		curListVideos = info.Video
-		*/
+	*/
 	case "play":
 		msgPrintln("play")
+		playbackMu.Lock()
 		playState = "1"
 		startTime = time.Now().Add(-curTime)
-		postBind("onStateChange", map[string]string{
-			"currentTime": fmt.Sprintf("%.3f", curTime.Seconds()),
-			"state":       "1",
-			"duration":    strconv.Itoa(curVideo.Length),
-			"cpn":         "foo",
-		})
+		playbackMu.Unlock()
+		postBindOnStateChangeEmit()
+		postBindNowPlayingFromGlobals()
 	case "pause":
 		msgPrintln("pause")
+		playbackMu.Lock()
 		playState = "2"
-		curTime = time.Now().Sub(startTime)
-		postBind("onStateChange", map[string]string{
-			"currentTime": fmt.Sprintf("%.3f", curTime.Seconds()),
-			"state":       "2",
-			"duration":    strconv.Itoa(curVideo.Length),
-			"cpn":         "foo",
-		})
+		curTime = time.Since(startTime)
+		playbackMu.Unlock()
+		postBindOnStateChangeEmit()
+		postBindNowPlayingFromGlobals()
 	case "getVolume":
-		postBind("onVolumeChanged", map[string]string{"volume": currentVolume, "muted": "false"})
+		postBind("onVolumeChanged", map[string]string{"volume": currentVolume, "muted": strconv.FormatBool(currentMuted)})
 	case "setVolume":
 		data := paramsList[0].(map[string]interface{})
 		currentVolume = data["volume"].(string)
+		currentMuted = false
 		msgPrintln(fmt.Sprint("set_volume ", currentVolume))
-		postBind("onVolumeChanged", map[string]string{"volume": currentVolume, "muted": "false"})
+		postBind("onVolumeChanged", map[string]string{"volume": currentVolume, "muted": strconv.FormatBool(currentMuted)})
+	case "mute":
+		currentMuted = true
+		msgPrintln("mute")
+		postBind("onVolumeChanged", map[string]string{"volume": currentVolume, "muted": strconv.FormatBool(currentMuted)})
+	case "unmute", "unMute":
+		currentMuted = false
+		msgPrintln("unmute")
+		postBind("onVolumeChanged", map[string]string{"volume": currentVolume, "muted": strconv.FormatBool(currentMuted)})
 	case "seekTo":
 		data := paramsList[0].(map[string]interface{})
 		newTime := data["newTime"].(string)
@@ -390,67 +820,124 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		if err != nil {
 			currentTimeDuration = 0
 		}
+		playbackMu.Lock()
 		curTime = currentTimeDuration
 		startTime = time.Now().Add(-curTime)
-
-		postBind("onStateChange", map[string]string{
-			"currentTime": newTime,
-			"state":       playState,
-			"duration":    strconv.Itoa(curVideo.Length),
-			"cpn":         "foo",
-		})
+		playbackMu.Unlock()
+		postBindOnStateChangeEmit()
+		postBindNowPlayingFromGlobals()
 	case "stopVideo":
+		dialStateMu.Lock()
+		curVideoId = ""
+		curVideo = Video{}
+		dialStateMu.Unlock()
 		msgPrintln("stop")
 		postBind("nowPlaying", map[string]string{})
+	case "skipAd":
+		msgPrintln("skip_ad")
+	case "setSubtitlesTrack":
+		data := paramsList[0].(map[string]interface{})
+		langCode, _ := data["languageCode"].(string)
+		videoId, _ := data["videoId"].(string)
+		if videoId == "" {
+			dialStateMu.RLock()
+			videoId = curVideoId
+			dialStateMu.RUnlock()
+		}
+		if langCode == "" {
+			msgPrintln("set_subtitles off")
+		} else if videoId != "" {
+			msgPrintln(fmt.Sprintf("set_subtitles %s %s", videoId, langCode))
+		} else {
+			dbgPrintln("skipping subtitle track change: no video id")
+		}
 	case "onUserActivity":
 		msgPrintln("user_action")
+	case "getDiscoveryDeviceId":
+		msgPrintln(fmt.Sprint("discovery_device_id ", screenUid))
+		postBind("discoveryDeviceId", map[string]string{"deviceId": screenUid})
+	case "setAutoplayMode":
+		if len(paramsList) > 0 {
+			if data, ok := paramsList[0].(map[string]interface{}); ok {
+				mode := getMapString(data, "autoplayMode")
+				if mode != "" {
+					msgPrintln(fmt.Sprint("set_autoplay_mode ", mode))
+				}
+			}
+		}
+	case "setAudioTrack":
+		if len(paramsList) > 0 {
+			if data, ok := paramsList[0].(map[string]interface{}); ok {
+				id := getMapString(data, "id")
+				lang := getMapString(data, "languageCode")
+				if id != "" || lang != "" {
+					msgPrintln(fmt.Sprintf("set_audio_track %s %s", id, lang))
+				}
+			}
+		}
+	case "setPlaybackQuality":
+		if len(paramsList) > 0 {
+			if data, ok := paramsList[0].(map[string]interface{}); ok {
+				quality := getMapString(data, "quality")
+				if quality != "" {
+					msgPrintln(fmt.Sprint("set_playback_quality ", quality))
+				}
+			}
+		}
+	case "setPlaybackRate":
+		if len(paramsList) > 0 {
+			if data, ok := paramsList[0].(map[string]interface{}); ok {
+				rate := getMapString(data, "rate")
+				if rate != "" {
+					msgPrintln(fmt.Sprint("set_playback_rate ", rate))
+				}
+			}
+		}
+	case "loungeScreenDisconnected":
+		stopCurrentVideo()
+	case "onSubtitlesTrackChanged", "onAudioTrackChanged", "onAutoplayModeChanged",
+		"onHasPreviousNextChanged", "onVideoQualityChanged", "onVolumeChanged",
+		"onPlaylistModeChanged", "autoplayUpNext", "adPlaying", "onAdStateChange":
+		msgPrintln(fmt.Sprintf("event %s %s", cmd, formatDebugParams(paramsList)))
 	case "next":
 		msgPrintln("next")
 		if curIndex+1 < len(curList) {
 			curIndex++
+			playbackMu.Lock()
+			loungeCPN = newLoungeCPN()
 			curTime = 0
 			startTime = time.Now()
-			curVideoId = curList[curIndex]
-			curVideo = curListVideos[curIndex]
-			msgPrintln(fmt.Sprint("video_id ", curVideoId))
-			postBind("nowPlaying", map[string]string{
-				"videoId":      curVideoId,
-				"currentTime":  "0",
-				"listId":       curListId,
-				"currentIndex": strconv.Itoa(curIndex),
-				"state":        "3",
-			})
 			playState = "1"
-			postBind("onStateChange", map[string]string{
-				"currentTime": "0",
-				"state":       "1",
-				"duration":    strconv.Itoa(curVideo.Length),
-				"cpn":         "foo",
-			})
+			playbackMu.Unlock()
+			dialStateMu.Lock()
+			curVideoId = curList[curIndex]
+			if curIndex < len(curListVideos) {
+				curVideo = curListVideos[curIndex]
+			}
+			dialStateMu.Unlock()
+			msgPrintln(fmt.Sprint("video_id ", curVideoId))
+			postBindNowPlayingFromGlobals()
+			postBindOnStateChangeEmit()
 		}
 	case "previous":
 		msgPrintln("previous")
 		if curIndex > 0 {
 			curIndex--
+			playbackMu.Lock()
+			loungeCPN = newLoungeCPN()
 			curTime = 0
 			startTime = time.Now()
-			curVideoId = curList[curIndex]
-			curVideo = curListVideos[curIndex]
-			msgPrintln(fmt.Sprint("video_id ", curVideoId))
-			postBind("nowPlaying", map[string]string{
-				"videoId":      curVideoId,
-				"currentTime":  "0",
-				"listId":       curListId,
-				"currentIndex": strconv.Itoa(curIndex),
-				"state":        "3",
-			})
 			playState = "1"
-			postBind("onStateChange", map[string]string{
-				"currentTime": "0",
-				"state":       "1",
-				"duration":    strconv.Itoa(curVideo.Length),
-				"cpn":         "foo",
-			})
+			playbackMu.Unlock()
+			dialStateMu.Lock()
+			curVideoId = curList[curIndex]
+			if curIndex < len(curListVideos) {
+				curVideo = curListVideos[curIndex]
+			}
+			dialStateMu.Unlock()
+			msgPrintln(fmt.Sprint("video_id ", curVideoId))
+			postBindNowPlayingFromGlobals()
+			postBindOnStateChangeEmit()
 		}
 	default:
 		msgPrintln(fmt.Sprintf("generic_cmd %s %v", cmd, paramsList))
@@ -462,19 +949,60 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 	*/
 }
 
+func cloneURLValues(v url.Values) url.Values {
+	if v == nil {
+		return nil
+	}
+	out := make(url.Values, len(v))
+	for k, vals := range v {
+		cp := make([]string, len(vals))
+		copy(cp, vals)
+		out[k] = cp
+	}
+	return out
+}
+
+func getMapString(data map[string]interface{}, key string) string {
+	if data == nil {
+		return ""
+	}
+	v, ok := data[key]
+	if !ok || v == nil {
+		return ""
+	}
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+	return s
+}
+
 func postBind(sc string, params map[string]string) {
-	ofs++
-	postVals := url.Values{"count": {"1"}, "ofs": {fmt.Sprintf("%v", ofs)}}
+	postBindMu.Lock()
+	defer postBindMu.Unlock()
+	nextOfs := atomic.AddUint64(&ofs, 1)
+	postVals := url.Values{"count": {"1"}, "ofs": {fmt.Sprintf("%v", nextOfs)}}
 	postVals["req0__sc"] = []string{sc}
 	for k, v := range params {
 		postVals["req0_"+k] = []string{v}
 	}
 	bindVals["RID"] = []string{"1337"}
-	resp, err := http.PostForm("https://www.youtube.com/api/lounge/bc/bind?"+bindVals.Encode(), postVals)
+	if traceProtocol {
+		dbgPrintln(fmt.Sprintf("proto_out sc=%s params=%s", sc, formatURLValues(postVals)))
+	}
+	resp, err := outboundHTTP.PostForm("https://www.youtube.com/api/lounge/bc/bind?"+bindVals.Encode(), postVals)
 	if err != nil {
 		panic(err)
 	}
+	body, readErr := ioutil.ReadAll(resp.Body)
 	resp.Body.Close()
+	if traceProtocol {
+		if readErr != nil {
+			dbgPrintln(fmt.Sprintf("proto_resp sc=%s status=%d read_err=%v", sc, resp.StatusCode, readErr))
+		} else {
+			dbgPrintln(fmt.Sprintf("proto_resp sc=%s status=%d body=%s", sc, resp.StatusCode, sanitizeLogBody(string(body))))
+		}
+	}
 }
 
 func debugInfo() {
@@ -493,7 +1021,7 @@ func debugInfo() {
 }
 
 func getListInfo(listId string) (ret *PlaylistInfo) {
-	resp, err := http.Get("https://www.youtube.com/list_ajax?style=json&action_get_list=1&list=" + listId)
+	resp, err := outboundHTTP.Get("https://www.youtube.com/list_ajax?style=json&action_get_list=1&list=" + listId)
 	if err != nil {
 		panic(err)
 	}
@@ -528,10 +1056,98 @@ func msgPrintln(line string) {
 
 func dbgPrintln(line string) {
 	if debugLevel >= 1 {
+		if debugLogFile == nil {
+			return
+		}
+		printLock.Lock()
+		defer printLock.Unlock()
 		if debugLevel >= 2 {
-			msgPrintln(fmt.Sprint("dbg ", time.Now().Format(timefmt), " ", line))
+			fmt.Fprintln(debugLogFile, fmt.Sprint("dbg ", time.Now().Format(timefmt), " ", line))
 		} else {
-			msgPrintln(fmt.Sprint("dbg ", line))
+			fmt.Fprintln(debugLogFile, fmt.Sprint("dbg ", line))
 		}
 	}
+}
+
+func formatDebugParams(params []interface{}) string {
+	normalized := normalizeDebugValue(params)
+	body, err := json.Marshal(normalized)
+	if err != nil {
+		return fmt.Sprintf("%v", params)
+	}
+	return string(body)
+}
+
+func normalizeDebugValue(v interface{}) interface{} {
+	switch val := v.(type) {
+	case map[string]interface{}:
+		normalized := make(map[string]interface{}, len(val))
+		for key, item := range val {
+			normalized[key] = normalizeDebugValue(item)
+		}
+		return normalized
+	case []interface{}:
+		normalized := make([]interface{}, len(val))
+		for i, item := range val {
+			normalized[i] = normalizeDebugValue(item)
+		}
+		return normalized
+	case string:
+		if parsed, ok := parseEmbeddedJSON(val); ok {
+			return normalizeDebugValue(parsed)
+		}
+		return val
+	default:
+		return val
+	}
+}
+
+func parseEmbeddedJSON(s string) (interface{}, bool) {
+	trimmed := strings.TrimSpace(s)
+	if len(trimmed) < 2 {
+		return nil, false
+	}
+	isObject := trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}'
+	isArray := trimmed[0] == '[' && trimmed[len(trimmed)-1] == ']'
+	if !isObject && !isArray {
+		return nil, false
+	}
+
+	var parsed interface{}
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	dec.UseNumber()
+	if err := dec.Decode(&parsed); err != nil {
+		return nil, false
+	}
+
+	return parsed, true
+}
+
+func formatURLValues(vals url.Values) string {
+	plain := make(map[string]interface{}, len(vals))
+	for key, list := range vals {
+		switch len(list) {
+		case 0:
+			plain[key] = ""
+		case 1:
+			plain[key] = list[0]
+		default:
+			multi := make([]string, len(list))
+			copy(multi, list)
+			plain[key] = multi
+		}
+	}
+	body, err := json.Marshal(plain)
+	if err != nil {
+		return fmt.Sprintf("%v", vals)
+	}
+	return string(body)
+}
+
+func sanitizeLogBody(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return "\"\""
+	}
+	return trimmed
 }

@@ -1,0 +1,28 @@
+[Unit]
+Description=GoTubeCast — YouTube cast device
+Documentation=https://github.com/caraar12345/gotubecast
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/lib/gotubecast/cast.py
+Restart=on-failure
+RestartSec=5
+
+# Include ~/.local/bin on PATH so the gotubecast binary (installed by setup.sh)
+# is found when cast.py spawns it as a subprocess.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:%h/.local/bin
+
+# Wayland display socket (labwc on Raspberry Pi OS uses wayland-0).
+Environment=WAYLAND_DISPLAY=wayland-0
+
+# Uncomment for a dedicated fullscreen display:
+#Environment=MPV_OPTS=--fullscreen
+
+# Optional per-user overrides — create this file to customise without editing
+# the service unit (SCREEN_NAME, DIAL_PORT, SUB_LANG, VIDEO_QUALITY, …).
+EnvironmentFile=-%h/.config/gotubecast/env
+
+[Install]
+WantedBy=graphical-session.target
