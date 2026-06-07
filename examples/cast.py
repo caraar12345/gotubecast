@@ -130,6 +130,9 @@ def _playback_observer(gtc: subprocess.Popen) -> None:
     """Push mpv pause/time-pos to gotubecast stdin so the Lounge client UI stays in sync."""
     last_pause: Optional[bool] = None
     last_play_generation = 0
+    last_alive: bool = False
+    last_position_sent: float = 0.0  # time.monotonic() of last position notification
+    POSITION_INTERVAL = 5.0          # seconds between periodic position corrections
     while gtc.poll() is None:
         time.sleep(0.25)
         with _mpv_lock:
@@ -138,6 +141,18 @@ def _playback_observer(gtc: subprocess.Popen) -> None:
         if gen != last_play_generation:
             last_play_generation = gen
             last_pause = None
+            last_alive = False
+            last_position_sent = 0.0
+        # Notify gotubecast when mpv exits so the Lounge session is cleared.
+        if last_alive and not alive:
+            last_alive = False
+            try:
+                if gtc.stdin and not gtc.stdin.closed:
+                    gtc.stdin.write("playback_ended\n")
+                    gtc.stdin.flush()
+            except (BrokenPipeError, OSError, TypeError, ValueError):
+                return
+        last_alive = alive
         if not alive:
             last_pause = None
             continue
@@ -147,7 +162,11 @@ def _playback_observer(gtc: subprocess.Popen) -> None:
         if pause_raw is None:
             continue
         paused = bool(pause_raw)
-        if last_pause is not None and paused == last_pause:
+        now = time.monotonic()
+        state_changed = last_pause is None or paused != last_pause
+        # Send periodic position corrections during playback so seek drift is resolved.
+        periodic_update = not paused and (now - last_position_sent >= POSITION_INTERVAL)
+        if not state_changed and not periodic_update:
             continue
         last_pause = paused
         t_raw = mpv_get_property("time-pos")
@@ -161,6 +180,7 @@ def _playback_observer(gtc: subprocess.Popen) -> None:
             if gtc.stdin and not gtc.stdin.closed:
                 gtc.stdin.write(line)
                 gtc.stdin.flush()
+                last_position_sent = now
         except (BrokenPipeError, OSError, TypeError, ValueError):
             return
 

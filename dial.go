@@ -34,6 +34,14 @@ func init() {
 	flag.IntVar(&dialHTTPPort, "p", 8008, "DIAL server HTTP port (0 to disable)")
 }
 
+// loungeAppName returns the DIAL application name for the configured theme.
+func loungeAppName() string {
+	if screenTheme == "ytm" {
+		return "YouTubeMusic"
+	}
+	return "YouTube"
+}
+
 // xmlEsc returns s with XML special characters escaped.
 func xmlEsc(s string) string {
 	var b strings.Builder
@@ -48,14 +56,15 @@ func startDIAL() {
 		return
 	}
 	dialLocalIP = getOutboundIP()
-	msgPrintln(fmt.Sprintf("dial_url http://%s:%d/apps/YouTube", dialLocalIP, dialHTTPPort))
+	appName := loungeAppName()
+	msgPrintln(fmt.Sprintf("dial_url http://%s:%d/apps/%s", dialLocalIP, dialHTTPPort, appName))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/dd.xml", handleDIALDesc)
 	mux.HandleFunc("/dial/dd.xml", handleDIALDesc)
 	mux.HandleFunc("/ssdp/device-desc.xml", handleDIALDesc)
-	mux.HandleFunc("/apps/YouTube/run", handleYouTubeInstance)
-	mux.HandleFunc("/apps/YouTube", handleYouTubeApp)
+	mux.HandleFunc("/apps/"+appName+"/run", handleYouTubeInstance)
+	mux.HandleFunc("/apps/"+appName, handleYouTubeApp)
 	mux.HandleFunc("/apps/", handleApps)
 
 	addr := fmt.Sprintf(":%d", dialHTTPPort)
@@ -120,7 +129,7 @@ func handleYouTubeApp(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 		fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
 <service xmlns="urn:dial-multiscreen-org:schemas:dial">
-  <name>YouTube</name>
+  <name>%s</name>
   <options allowStop="true"/>
   <state>%s</state>
   <additionalData>
@@ -130,7 +139,7 @@ func handleYouTubeApp(w http.ResponseWriter, r *http.Request) {
     <deviceId>%s</deviceId>
     <deviceName>%s</deviceName>
   </additionalData>
-</service>`, state, xmlEsc(screenId), xmlEsc(currentLoungeToken), xmlEsc(screenUid), xmlEsc(screenName))
+</service>`, loungeAppName(), state, xmlEsc(screenId), xmlEsc(currentLoungeToken), xmlEsc(screenUid), xmlEsc(screenName))
 	case http.MethodPost:
 		// Standard DIAL uses application/x-www-form-urlencoded. The iOS YouTube
 		// app sends the same key=value body as Content-Type: text/plain, which
@@ -167,7 +176,7 @@ func handleYouTubeApp(w http.ResponseWriter, r *http.Request) {
 		} else {
 			dialTracef("youtube_post_missing_pairing_code")
 		}
-		w.Header().Set("Location", fmt.Sprintf("http://%s:%d/apps/YouTube/run", dialLocalIP, dialHTTPPort))
+		w.Header().Set("Location", fmt.Sprintf("http://%s:%d/apps/%s/run", dialLocalIP, dialHTTPPort, loungeAppName()))
 		w.WriteHeader(http.StatusCreated)
 	case http.MethodDelete:
 		dialStateMu.Lock()
@@ -227,12 +236,12 @@ func handleYouTubeInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-	fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>
+	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
 <service xmlns="urn:dial-multiscreen-org:schemas:dial">
-  <name>YouTube</name>
+  <name>%s</name>
   <options allowStop="true"/>
   <state>running</state>
-</service>`)
+</service>`, loungeAppName())
 }
 
 func handleApps(w http.ResponseWriter, r *http.Request) {

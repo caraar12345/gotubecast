@@ -25,3 +25,6 @@ _testmain.go
 /gotubecast
 **/__pycache__/
 gotubecast-debug.log
+
+# Local TLS-inspecting proxy CA cert (debugging only)
+*.pem

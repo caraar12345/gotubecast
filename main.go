@@ -65,6 +65,7 @@ var (
 	screenId        string
 	screenName      string
 	screenApp       string
+	screenTheme     string
 	bindVals        url.Values
 	currentVolume   string = "100"
 	currentMuted    bool   = false
@@ -88,6 +89,9 @@ var (
 	playbackMu    sync.Mutex
 	postBindMu    sync.Mutex
 	loungeCPN     string // Client Playback Nonce; refreshed per video for Lounge bind
+
+	connectedRemotes   = map[string]string{} // remote id → display name
+	connectedRemotesMu sync.Mutex
 )
 
 // YouTube watch HTML embeds duration in player response JSON.
@@ -104,6 +108,7 @@ func init() {
 	flag.BoolVar(&traceProtocol, "trace-protocol", false, "Trace incoming commands and outgoing bind responses in debug log")
 	flag.StringVar(&screenName, "n", defaultScreenName, "Display Name")
 	flag.StringVar(&screenApp, "i", defaultScreenApp, "Display App")
+	flag.StringVar(&screenTheme, "theme", "cl", "Lounge theme: cl=YouTube, ytm=YouTube Music")
 	flag.StringVar(&screenId, "s", "", "Screen ID (will be generated if empty)")
 }
 
@@ -169,7 +174,7 @@ func main() {
 		"id":     {screenUid},
 		"name":   {screenName},
 		"app":    {screenApp},
-		"theme":  {"cl"},
+		"theme":  {screenTheme},
 		// Must be non-empty: url.Values with an empty slice omits the key entirely,
 		// and YouTube will not send cast/playlist commands to a receiver with no caps.
 		"capabilities":  {"que,mus"},
@@ -453,6 +458,27 @@ func loungeEmitAt(state string, posSec float64) {
 	dbgPrintln(fmt.Sprintf("stdin playback_notify state=%s time=%.3f", state, posSec))
 }
 
+// stopCurrentVideo clears playback state and notifies the Lounge API that nothing is playing.
+// Safe to call when nothing is playing (no-op if curVideoId is already empty).
+func stopCurrentVideo() {
+	dialStateMu.Lock()
+	if curVideoId == "" {
+		dialStateMu.Unlock()
+		return
+	}
+	curVideoId = ""
+	curVideo = Video{}
+	dialStateMu.Unlock()
+
+	playbackMu.Lock()
+	playState = "3"
+	curTime = 0
+	playbackMu.Unlock()
+
+	msgPrintln("stop")
+	postBind("nowPlaying", map[string]string{})
+}
+
 // applySetPlaylistPlaybackState mirrors mobile playbackState into the Lounge bind stream.
 // YouTube iOS often sends play/pause only via setPlaylist, not discrete play/pause RPCs.
 func applySetPlaylistPlaybackState(playbackState, currentTimeStr string, notifyPlayer bool) {
@@ -497,6 +523,10 @@ func readStdinPlayback() {
 			continue
 		}
 		fields := strings.Fields(line)
+		if len(fields) >= 1 && fields[0] == "playback_ended" {
+			stopCurrentVideo()
+			continue
+		}
 		if len(fields) != 3 || fields[0] != "playback_notify" {
 			continue
 		}
@@ -543,11 +573,21 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		data := paramsList[0].(map[string]interface{})
 		id := data["id"].(string)
 		name := data["name"].(string)
+		connectedRemotesMu.Lock()
+		connectedRemotes[id] = name
+		connectedRemotesMu.Unlock()
 		msgPrintln(fmt.Sprint("remote_join ", id, " ", name))
 	case "remoteDisconnected":
 		data := paramsList[0].(map[string]interface{})
 		id := data["id"].(string)
+		connectedRemotesMu.Lock()
+		delete(connectedRemotes, id)
+		empty := len(connectedRemotes) == 0
+		connectedRemotesMu.Unlock()
 		msgPrintln(fmt.Sprint("remote_leave ", id))
+		if empty {
+			stopCurrentVideo()
+		}
 	case "getNowPlaying":
 		playbackMu.Lock()
 		if playState == "1" {
@@ -828,10 +868,11 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 				}
 			}
 		}
+	case "loungeScreenDisconnected":
+		stopCurrentVideo()
 	case "onSubtitlesTrackChanged", "onAudioTrackChanged", "onAutoplayModeChanged",
 		"onHasPreviousNextChanged", "onVideoQualityChanged", "onVolumeChanged",
-		"onPlaylistModeChanged", "autoplayUpNext", "adPlaying", "onAdStateChange",
-		"loungeScreenDisconnected":
+		"onPlaylistModeChanged", "autoplayUpNext", "adPlaying", "onAdStateChange":
 		msgPrintln(fmt.Sprintf("event %s %s", cmd, formatDebugParams(paramsList)))
 	case "next":
 		msgPrintln("next")
