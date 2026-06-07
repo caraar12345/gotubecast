@@ -119,12 +119,21 @@ func handleYouTubeApp(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
+		// The app is "running" as soon as a remote attaches — not only once media
+		// is loaded. The iOS YouTube app polls this endpoint right after connecting
+		// (before setPlaylist finishes its blocking duration fetch). Reporting
+		// "stopped" in that window makes the phone believe the receiver app died
+		// (MDX_SESSION_DISCONNECT_BEHAVIOR_SCREEN_APP_STOPPED) and disconnect.
 		dialStateMu.RLock()
+		hasVideo := curVideoId != ""
+		dialStateMu.RUnlock()
+		connectedRemotesMu.Lock()
+		hasRemote := len(connectedRemotes) > 0
+		connectedRemotesMu.Unlock()
 		state := "stopped"
-		if curVideoId != "" {
+		if hasVideo || hasRemote {
 			state = "running"
 		}
-		dialStateMu.RUnlock()
 
 		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 		fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>

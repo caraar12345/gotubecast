@@ -92,7 +92,15 @@ var (
 
 	connectedRemotes   = map[string]string{} // remote id → display name
 	connectedRemotesMu sync.Mutex
+	pendingStopTimer   *time.Timer // debounces stop-on-disconnect; guarded by connectedRemotesMu
 )
+
+// remoteDisconnectGrace is how long to wait after the last remote disconnects
+// before stopping playback. The Lounge protocol emits transient
+// remoteDisconnected/remoteConnected churn during normal operation (the phone
+// briefly drops and re-establishes its bind session every few seconds), so we
+// only stop if no remote has reconnected within this window.
+const remoteDisconnectGrace = 8 * time.Second
 
 // YouTube watch HTML embeds duration in player response JSON.
 var (
@@ -575,6 +583,11 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		name := data["name"].(string)
 		connectedRemotesMu.Lock()
 		connectedRemotes[id] = name
+		// A remote (re)connected: cancel any pending stop from a transient drop.
+		if pendingStopTimer != nil {
+			pendingStopTimer.Stop()
+			pendingStopTimer = nil
+		}
 		connectedRemotesMu.Unlock()
 		msgPrintln(fmt.Sprint("remote_join ", id, " ", name))
 	case "remoteDisconnected":
@@ -582,12 +595,24 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		id := data["id"].(string)
 		connectedRemotesMu.Lock()
 		delete(connectedRemotes, id)
-		empty := len(connectedRemotes) == 0
+		// Debounce: only stop if no remote reconnects within the grace window.
+		// remoteDisconnected fires transiently during normal Lounge operation.
+		if len(connectedRemotes) == 0 {
+			if pendingStopTimer != nil {
+				pendingStopTimer.Stop()
+			}
+			pendingStopTimer = time.AfterFunc(remoteDisconnectGrace, func() {
+				connectedRemotesMu.Lock()
+				stillEmpty := len(connectedRemotes) == 0
+				pendingStopTimer = nil
+				connectedRemotesMu.Unlock()
+				if stillEmpty {
+					stopCurrentVideo()
+				}
+			})
+		}
 		connectedRemotesMu.Unlock()
 		msgPrintln(fmt.Sprint("remote_leave ", id))
-		if empty {
-			stopCurrentVideo()
-		}
 	case "getNowPlaying":
 		playbackMu.Lock()
 		if playState == "1" {
