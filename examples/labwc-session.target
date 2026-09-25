@@ -1,0 +1,15 @@
+# Bridges labwc into systemd's user-session model.
+#
+# Raspberry Pi OS's labwc package documents labwc-session.target in labwc(1)
+# but does not actually ship the unit, so graphical-session.target is never
+# activated and anything WantedBy= it never starts. This supplies it.
+#
+# Activated from labwc's autostart; torn down from labwc's shutdown.
+
+[Unit]
+Description=labwc session
+Documentation=man:labwc(1)
+BindsTo=graphical-session.target
+Before=graphical-session.target
+Wants=graphical-session-pre.target
+After=graphical-session-pre.target

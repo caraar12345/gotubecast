@@ -193,6 +193,57 @@ else
     echo "    Refreshed gotubecast-cast.service (run: systemctl --user daemon-reload already done)."
 fi
 
+# ── labwc → systemd session bridge ───────────────────────────────────────────
+#
+# gotubecast-cast.service is WantedBy=graphical-session.target, but labwc on
+# Raspberry Pi OS never activates that target: labwc(1) documents
+# labwc-session.target yet the Debian package does not ship the unit, and the
+# lightdm→labwc session has no systemd integration (it uses lxsession XDG
+# autostart instead). Without this, the service is "enabled" but never starts.
+
+echo ">>> Wiring labwc into the systemd user session..."
+cp "${REPO_DIR}/examples/labwc-session.target" "${SYSTEMD_USER}/labwc-session.target"
+systemctl --user daemon-reload 2>/dev/null || true
+
+LABWC_CONF="${HOME}/.config/labwc"
+mkdir -p "${LABWC_CONF}"
+
+# labwc reads only the FIRST autostart found unless started with -m/--merge-config.
+# Raspberry Pi OS uses `labwc -m` (see /usr/bin/labwc-pi), so a user file augments
+# the system one. Without -m it would REPLACE it, taking the panel and desktop
+# with it — so warn rather than silently break the session.
+if ! grep -qs -- '-m\|--merge-config' /usr/bin/labwc-pi 2>/dev/null \
+   && [[ -f /etc/xdg/labwc/autostart ]] && [[ ! -f "${LABWC_CONF}/autostart" ]]; then
+    echo "    WARNING: labwc does not appear to use --merge-config, and a system"
+    echo "             autostart exists at /etc/xdg/labwc/autostart."
+    echo "             Copy its contents into ${LABWC_CONF}/autostart as well,"
+    echo "             or your panel/desktop will not start."
+fi
+
+if ! grep -qs 'labwc-session.target' "${LABWC_CONF}/autostart" 2>/dev/null; then
+    cat >> "${LABWC_CONF}/autostart" <<'EOF'
+
+# Activate the systemd user session target so units declaring
+# WantedBy=graphical-session.target start in sync with the labwc session.
+systemctl --user --no-block start labwc-session.target
+EOF
+    echo "    Added labwc-session.target activation to ${LABWC_CONF}/autostart"
+else
+    echo "    ${LABWC_CONF}/autostart already activates labwc-session.target"
+fi
+
+if ! grep -qs 'graphical-session.target' "${LABWC_CONF}/shutdown" 2>/dev/null; then
+    cat >> "${LABWC_CONF}/shutdown" <<'EOF'
+
+# Tear down graphical-session.target before the Wayland socket goes away,
+# so services stop cleanly instead of failing with "Broken pipe".
+systemctl --user stop graphical-session.target
+EOF
+    echo "    Added graphical-session.target teardown to ${LABWC_CONF}/shutdown"
+else
+    echo "    ${LABWC_CONF}/shutdown already tears down graphical-session.target"
+fi
+
 # ── done ─────────────────────────────────────────────────────────────────────
 
 echo ""

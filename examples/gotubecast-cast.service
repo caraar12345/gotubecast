@@ -2,12 +2,12 @@
 Description=GoTubeCast — YouTube cast device
 Documentation=https://github.com/caraar12345/gotubecast
 After=graphical-session.target
-Wants=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 %h/.local/lib/gotubecast/cast.py
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 # Include ~/.local/bin on PATH so the gotubecast binary (installed by setup.sh)

@@ -27,6 +27,7 @@ python3 examples/cast.py        # full Pi integration (runs gotubecast + mpv)
 | `examples/cast.py` | Python integration: spawns gotubecast, routes commands to mpv via IPC |
 | `examples/setup.sh` | One-shot Pi installer: packages, uosc, touch-gestures, binary, service |
 | `examples/gotubecast-cast.service` | systemd user unit for auto-start on login |
+| `examples/labwc-session.target` | Supplies the systemd user target labwc's package omits (see gotchas) |
 
 ## Architecture
 
@@ -104,8 +105,10 @@ In `cast.py`: `_mpv_lock` protects `_mpv_proc`, `_play_generation`, `_subtitle_g
 | `SCREEN_ID` | _(auto)_ | Set to persist device identity across restarts |
 | `DIAL_PORT` | `8008` | Must match gotubecast `-p` |
 | `SUB_LANG` | `en` | Subtitle language; blank to disable |
+| `SUB_FONT_SIZE` | `30` | Subtitle font size (mpv units; mpv default is 55) |
 | `VIDEO_QUALITY` | `1080` | Maximum video height for yt-dlp format selection |
-| `MPV_OPTS` | _(empty)_ | Extra mpv CLI flags, e.g. `--fullscreen` |
+| `FULLSCREEN` | `1` | Start mpv fullscreen; set `0` to disable |
+| `MPV_OPTS` | _(empty)_ | Extra mpv CLI flags; appended last, so overrides the above |
 
 ## Pi setup
 
@@ -124,4 +127,13 @@ The service targets `graphical-session.target` and sets `WAYLAND_DISPLAY=wayland
 - **`ioutil` is deprecated** — new code should use `io.ReadAll` / `os.ReadFile`. Existing uses in `main.go` remain for Go 1.16 compat but are candidates for cleanup.
 - **`screenUid` is hardcoded** in `main.go`. The `screenId` is generated per-run (or supplied via `-s`). These are different: `screenUid` is a stable device UUID; `screenId` is the YouTube Lounge registration ID.
 - **Lounge token expiry** — `get_lounge_token_batch` is called once at startup. Tokens expire (~24h). On expiry, the bind loop will start failing; a restart regenerates the token. Long-running daemon support is a known TODO.
+- **`graphical-session.target` is not automatic on Raspberry Pi OS** — the service is
+  `WantedBy=graphical-session.target`, but the lightdm→labwc session never activates that
+  target: `labwc(1)` documents `labwc-session.target`, yet the Debian package does not ship
+  the unit, and the session uses lxsession XDG autostart rather than systemd integration.
+  Symptom: `systemctl --user is-enabled` says `enabled` while `ActiveEnterTimestamp` is
+  empty — the unit has never run. `setup.sh` now installs `examples/labwc-session.target`
+  and hooks `~/.config/labwc/{autostart,shutdown}`. Note labwc reads only the *first*
+  autostart found unless run with `-m`/`--merge-config`; Pi OS does use `-m` (see
+  `/usr/bin/labwc-pi`), so a user file augments the system one instead of replacing it.
 - **yt-dlp format string** — in `cast.py`, the format string prefers `mp4+m4a` for hardware-accelerated playback on Pi. If yt-dlp returns two URLs, mpv receives both via `--audio-file=` (DASH demux).
