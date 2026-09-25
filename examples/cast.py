@@ -251,7 +251,11 @@ def fetch_subtitles(video_id: str, lang: str,
     # Preference order: the exact selected track, then the bare language code.
     vss_lang = _vss_to_lang(vss_id)
     wanted: list = []
-    for code in (vss_lang, lang):
+    # "<lang>-orig" is the untranslated ASR track. On some videos YouTube serves
+    # the plain "<lang>" auto track as a machine translation of it, and those
+    # translated tracks get rate-limited (HTTP 429) far more aggressively.
+    orig = f"{lang}-orig" if lang and "-" not in lang else None
+    for code in (vss_lang, lang, orig):
         if code and code not in wanted:
             wanted.append(code)
     if not wanted:
@@ -275,6 +279,7 @@ def fetch_subtitles(video_id: str, lang: str,
         subprocess.run(
             ["yt-dlp",
              "--write-subs", "--write-auto-subs",
+             "--ignore-errors",  # one track 429ing mustn't abort the others
              "--sub-langs", ",".join(wanted),
              "--sub-format", "vtt/best",
              "--skip-download",
