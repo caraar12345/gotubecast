@@ -69,6 +69,12 @@ var (
 	bindVals        url.Values
 	currentVolume   string = "100"
 	currentMuted    bool   = false
+	// Current subtitle selection, echoed back to the Lounge so the phone UI
+	// reflects the active track. Empty curSubLang means "off".
+	curSubVideoId   string
+	curSubLang      string
+	curSubVssId     string
+	curSubTrackName string
 	ofs             uint64 // lounge bind sequence; updated with atomic.AddUint64
 	playState       string = "3"
 	ctt             string
@@ -710,7 +716,25 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 
 		*/
 		if curVideoId != "" {
-			msgPrintln(fmt.Sprint("video_id ", curVideoId))
+			// Resume at the sender's position/state on connect, rather than
+			// restarting from 0. mpv gets the offset at launch (--start) so it
+			// seeks before the first frame — no race with a follow-up seek.
+			startSec := 0.0
+			if cts := getMapString(data, "currentTime"); cts != "" {
+				if d, err := time.ParseDuration(cts + "s"); err == nil && d > 0 {
+					startSec = d.Seconds()
+				}
+			}
+			paused := strings.EqualFold(strings.TrimSpace(getMapString(data, "playbackState")), "PAUSED")
+			if startSec > 0 || paused {
+				pb := "0"
+				if paused {
+					pb = "1"
+				}
+				msgPrintln(fmt.Sprintf("video_id %s %.3f %s", curVideoId, startSec, pb))
+			} else {
+				msgPrintln(fmt.Sprint("video_id ", curVideoId))
+			}
 		}
 		if ps := getMapString(data, "playbackState"); ps != "" {
 			applySetPlaylistPlaybackState(ps, getMapString(data, "currentTime"), true)
@@ -835,19 +859,35 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		postBind("nowPlaying", map[string]string{})
 	case "skipAd":
 		msgPrintln("skip_ad")
+	case "getSubtitlesTrack":
+		// Phone is querying the active track (e.g. to render the CC menu).
+		postBind("onSubtitlesTrackChanged", subtitlesTrackParams())
 	case "setSubtitlesTrack":
 		data := paramsList[0].(map[string]interface{})
 		langCode, _ := data["languageCode"].(string)
 		videoId, _ := data["videoId"].(string)
+		vssId, _ := data["vss_id"].(string)
+		trackName, _ := data["trackName"].(string)
 		if videoId == "" {
 			dialStateMu.RLock()
 			videoId = curVideoId
 			dialStateMu.RUnlock()
 		}
 		if langCode == "" {
+			curSubVideoId, curSubLang, curSubVssId, curSubTrackName = videoId, "", "", ""
 			msgPrintln("set_subtitles off")
+			postBind("onSubtitlesTrackChanged", subtitlesTrackParams())
 		} else if videoId != "" {
-			msgPrintln(fmt.Sprintf("set_subtitles %s %s", videoId, langCode))
+			curSubVideoId, curSubLang, curSubVssId, curSubTrackName = videoId, langCode, vssId, trackName
+			// Pass vss_id when present: many videos expose a manual track under a
+			// non-standard code (e.g. "en-ehkg1hFWq8A") plus an auto track under
+			// the plain "en", and only the vss_id disambiguates which was picked.
+			if vssId != "" {
+				msgPrintln(fmt.Sprintf("set_subtitles %s %s %s", videoId, langCode, vssId))
+			} else {
+				msgPrintln(fmt.Sprintf("set_subtitles %s %s", videoId, langCode))
+			}
+			postBind("onSubtitlesTrackChanged", subtitlesTrackParams())
 		} else {
 			dbgPrintln("skipping subtitle track change: no video id")
 		}
@@ -975,6 +1015,17 @@ func getMapString(data map[string]interface{}, key string) string {
 		return ""
 	}
 	return s
+}
+
+// subtitlesTrackParams builds the onSubtitlesTrackChanged payload from the
+// currently selected track. Empty languageCode signals "subtitles off".
+func subtitlesTrackParams() map[string]string {
+	return map[string]string{
+		"videoId":      curSubVideoId,
+		"languageCode": curSubLang,
+		"trackName":    curSubTrackName,
+		"vss_id":       curSubVssId,
+	}
 }
 
 func postBind(sc string, params map[string]string) {

@@ -28,9 +28,10 @@ Configuration (environment variables):
     GTC_DEBUG_ROOT_CA PEM path for extra TLS roots (MITM proxy) → -debug-root-ca
     GTC_TRACE_PROTOCOL Enable protocol trace logging (0/1)   (default: 0)
     SUB_LANG        Subtitle language code, e.g. "en"        (default: en, blank to disable)
+    SUB_FONT_SIZE   Subtitle font size (mpv units)           (default: 30; mpv default is 55)
     VIDEO_QUALITY   Maximum video height in pixels           (default: 1080)
-    MPV_OPTS        Extra mpv CLI options (space-separated)
-                    e.g. MPV_OPTS=--fullscreen for a dedicated display
+    FULLSCREEN      Start mpv fullscreen (0/1)               (default: 1)
+    MPV_OPTS        Extra mpv CLI options (space-separated); overrides the above
 
 Usage:
     python3 cast.py
@@ -57,7 +58,9 @@ DIAL_PORT     = int(os.environ.get("DIAL_PORT", "8008"))
 GTC_DEBUG_LEVEL = os.environ.get("GTC_DEBUG_LEVEL", "2")
 GTC_TRACE_PROTOCOL = os.environ.get("GTC_TRACE_PROTOCOL", "0")
 SUB_LANG      = os.environ.get("SUB_LANG",      "en")
+SUB_FONT_SIZE = os.environ.get("SUB_FONT_SIZE", "30")   # mpv default is 55
 VIDEO_QUALITY = os.environ.get("VIDEO_QUALITY", "1080")
+FULLSCREEN    = os.environ.get("FULLSCREEN",    "1") not in ("0", "", "false", "no")
 MPV_EXTRA     = os.environ.get("MPV_OPTS",      "").split()
 
 # Use XDG_RUNTIME_DIR when available (OS-managed, 0700); otherwise create a
@@ -215,22 +218,53 @@ def get_stream_urls(video_id: str) -> list:
     return [u for u in r.stdout.strip().splitlines() if u]
 
 
-def fetch_subtitles(video_id: str, lang: str) -> Optional[Path]:
-    """Download the subtitle file for video_id / lang into TEMP_DIR.
+def _vss_to_lang(vss_id: Optional[str]) -> Optional[str]:
+    """Map a Lounge vss_id to a yt-dlp subtitle language code.
 
-    Prefers manual captions; falls back to auto-generated ones.
-    Returns the Path of the downloaded .srt file, or None.
+    The phone identifies the *exact* track it selected with a vss_id like
+    ".en.ehkg1hFWq8A" (manual) or "a.en" (auto/ASR); yt-dlp names the same
+    track "en-ehkg1hFWq8A" / "en". Many videos expose a manual track under a
+    non-standard code (e.g. "en-ehkg1hFWq8A") alongside an auto track under the
+    plain "en", so selecting by languageCode alone always grabs the auto one.
+    Honouring the vss_id pins the track the user actually picked.
     """
-    if not lang:
+    if not vss_id:
         return None
+    body = vss_id[2:] if vss_id.startswith("a.") else vss_id.lstrip(".")
+    body = body.replace(".", "-")
+    return body or None
+
+
+def fetch_subtitles(video_id: str, lang: str,
+                    vss_id: Optional[str] = None) -> Optional[Path]:
+    """Download the subtitle track for video_id into TEMP_DIR.
+
+    Requests the vss_id-derived track first (the exact one the phone selected)
+    and falls back to the bare languageCode. Returns the Path of the best
+    matching .vtt file, or None.
+
+    YouTube serves WebVTT and mpv reads it natively, so we deliberately do
+    *not* convert to .srt: --convert-subs requires ffmpeg, and when ffmpeg is
+    absent yt-dlp downloads the .vtt but then exits non-zero on the failed
+    conversion, which used to make us discard a perfectly usable subtitle.
+    """
+    # Preference order: the exact selected track, then the bare language code.
+    vss_lang = _vss_to_lang(vss_id)
+    wanted: list = []
+    for code in (vss_lang, lang):
+        if code and code not in wanted:
+            wanted.append(code)
+    if not wanted:
+        return None
+
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     out_tmpl = str(TEMP_DIR / video_id)
 
-    # Remove stale files for this language before downloading so we can't
+    # Remove stale subtitle files for this video before downloading so we can't
     # accidentally return a leftover track from a previous request.
     for stale in [
-        *TEMP_DIR.glob(f"{video_id}.{lang}*.srt"),
-        *TEMP_DIR.glob(f"{video_id}.{lang}*.vtt"),
+        *TEMP_DIR.glob(f"{video_id}.*.srt"),
+        *TEMP_DIR.glob(f"{video_id}.*.vtt"),
     ]:
         try:
             stale.unlink()
@@ -238,12 +272,11 @@ def fetch_subtitles(video_id: str, lang: str) -> Optional[Path]:
             pass
 
     try:
-        result = subprocess.run(
+        subprocess.run(
             ["yt-dlp",
              "--write-subs", "--write-auto-subs",
-             "--sub-lang", lang,
+             "--sub-langs", ",".join(wanted),
              "--sub-format", "vtt/best",
-             "--convert-subs", "srt",
              "--skip-download",
              "--no-playlist",
              "-o", out_tmpl,
@@ -252,13 +285,17 @@ def fetch_subtitles(video_id: str, lang: str) -> Optional[Path]:
         )
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return None
-    if result.returncode != 0:
-        return None
-    candidates = (
-        sorted(TEMP_DIR.glob(f"{video_id}.{lang}*.srt")) +
-        sorted(TEMP_DIR.glob(f"{video_id}.{lang}*.vtt"))
-    )
-    return candidates[0] if candidates else None
+    # Select by file presence, not return code: when several langs are
+    # requested, a missing one makes yt-dlp exit non-zero even though the
+    # track we care about downloaded fine. Honour preference order.
+    for code in wanted:
+        for ext in ("srt", "vtt"):
+            p = TEMP_DIR / f"{video_id}.{code}.{ext}"
+            if p.exists():
+                return p
+    leftovers = (sorted(TEMP_DIR.glob(f"{video_id}.*.srt")) +
+                 sorted(TEMP_DIR.glob(f"{video_id}.*.vtt")))
+    return leftovers[0] if leftovers else None
 
 # ---------------------------------------------------------------------------
 # Playback control
@@ -277,7 +314,7 @@ def _reap_mpv() -> None:
         _mpv_proc = None
 
 
-def play_video(video_id: str) -> None:
+def play_video(video_id: str, start: float = 0.0, paused: bool = False) -> None:
     global _mpv_proc, _play_generation, _active_video_id
     with _mpv_lock:
         _play_generation += 1
@@ -327,8 +364,19 @@ def play_video(video_id: str) -> None:
         "--keep-open=no",
         "--really-quiet",
         "--no-osc",                        # replaced by uosc (installed by setup.sh)
+        f"--sub-font-size={SUB_FONT_SIZE}",
+        # Listed before MPV_EXTRA so MPV_OPTS can still override either default.
+        *(["--fullscreen"] if FULLSCREEN else []),
         *MPV_EXTRA,
     ]
+
+    # Resume at the sender's position / play state. --start seeks before the
+    # first frame, so there's no race against mpv's IPC socket coming up (which
+    # a post-spawn "seek" command would have).
+    if start > 0:
+        cmd.append(f"--start={start:.3f}")
+    if paused:
+        cmd.append("--pause")
 
     for sub in sub_result:
         cmd.append(f"--sub-file={sub}")
@@ -346,7 +394,8 @@ def play_video(video_id: str) -> None:
         _mpv_proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
 
 
-def load_subtitle_track(video_id: str, lang: str, generation: int) -> None:
+def load_subtitle_track(video_id: str, lang: str, generation: int,
+                        vss_id: Optional[str] = None) -> None:
     """Download a subtitle track and sideload it into the running mpv instance."""
     if not lang:
         mpv_ipc({"command": ["set_property", "sid", "no"]})
@@ -354,7 +403,7 @@ def load_subtitle_track(video_id: str, lang: str, generation: int) -> None:
     with _mpv_lock:
         if generation != _subtitle_generation or video_id != _active_video_id:
             return
-    sub = fetch_subtitles(video_id, lang)
+    sub = fetch_subtitles(video_id, lang, vss_id)
     if sub:
         with _mpv_lock:
             if generation != _subtitle_generation or video_id != _active_video_id:
@@ -382,10 +431,21 @@ def dispatch(line: str) -> None:
         print(f"DIAL: {url}", flush=True)
 
     elif cmd == "video_id":
+        # "video_id <id>"                        → play from start
+        # "video_id <id> <start_secs> <paused>"  → resume at offset / state
         vid = parts[1] if len(parts) > 1 else ""
         if vid:
+            start = 0.0
+            if len(parts) > 2:
+                try:
+                    start = max(0.0, float(parts[2]))
+                except ValueError:
+                    start = 0.0
+            paused = len(parts) > 3 and parts[3] == "1"
             print(f"Playing: {vid}", flush=True)
-            threading.Thread(target=play_video, args=(vid,), daemon=True).start()
+            threading.Thread(
+                target=play_video, args=(vid, start, paused), daemon=True
+            ).start()
 
     elif cmd == "play":
         mpv_ipc({"command": ["set_property", "pause", False]})
@@ -419,14 +479,16 @@ def dispatch(line: str) -> None:
         mpv_ipc({"command": ["set_property", "mute", False]})
 
     elif cmd == "set_subtitles":
-        # "set_subtitles off"            → disable
-        # "set_subtitles <id> <lang>"    → load track
+        # "set_subtitles off"                   → disable
+        # "set_subtitles <id> <lang> [vss_id]"  → load track
         if len(parts) >= 3 and parts[1] != "off":
+            vss = parts[3] if len(parts) >= 4 else None
             with _mpv_lock:
                 _subtitle_generation += 1
                 gen = _subtitle_generation
             threading.Thread(
-                target=load_subtitle_track, args=(parts[1], parts[2], gen), daemon=True
+                target=load_subtitle_track,
+                args=(parts[1], parts[2], gen, vss), daemon=True
             ).start()
         else:
             with _mpv_lock:
