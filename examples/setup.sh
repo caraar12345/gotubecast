@@ -2,7 +2,8 @@
 # setup.sh — one-shot install for gotubecast + cast.py on Raspberry Pi
 #
 # Installs:
-#   • mpv, yt-dlp, python3, curl (via apt)
+#   • mpv, python3, curl (via apt)
+#   • yt-dlp standalone binary + deno → ~/.local/bin
 #   • uosc        — feature-rich mpv UI  (https://github.com/tomasklaen/uosc)
 #   • pointer-event + touch-gestures     (https://github.com/christoph-heinrich)
 #   • gotubecast binary → ~/.local/bin/gotubecast  (built from source via go)
@@ -43,11 +44,40 @@ if [[ "${UPDATE_ONLY}" -eq 0 ]]; then
 echo ">>> Installing packages..."
 sudo apt-get update -qq
 sudo apt-get install -y --no-install-recommends \
-    mpv python3 python3-pip curl unzip
+    mpv python3 curl unzip
 
-# yt-dlp: prefer pip for a more up-to-date version than apt
-if ! command -v yt-dlp &>/dev/null; then
-    pip3 install --break-system-packages -q yt-dlp
+# yt-dlp: use the standalone release binary. It bundles its own Python plus
+# curl_cffi (browser impersonation), so it can't be broken by a distro Python
+# upgrade the way a `pip --user` / --break-system-packages install is (e.g.
+# Bookworm→Trixie moved python3 3.11→3.13 and orphaned the pip-installed
+# module). Update it later with `yt-dlp -U`.
+case "$(uname -m)" in
+    aarch64|arm64) YTDLP_ASSET="yt-dlp_linux_aarch64"; DENO_ARCH="aarch64" ;;
+    x86_64)        YTDLP_ASSET="yt-dlp_linux";         DENO_ARCH="x86_64"  ;;
+    *)             YTDLP_ASSET="";                      DENO_ARCH=""        ;;
+esac
+mkdir -p "${HOME}/.local/bin"
+if [[ -n "${YTDLP_ASSET}" ]]; then
+    echo ">>> Installing yt-dlp (${YTDLP_ASSET})..."
+    curl -fsSL -o "${HOME}/.local/bin/yt-dlp" \
+        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/${YTDLP_ASSET}"
+    chmod +x "${HOME}/.local/bin/yt-dlp"
+else
+    echo "    WARNING: no yt-dlp binary for $(uname -m); install yt-dlp manually."
+fi
+
+# deno: yt-dlp needs a JS runtime to solve YouTube's player challenges, or
+# formats go missing. Only deno is enabled by default (Debian's nodejs is too
+# old for yt-dlp's EJS solver anyway).
+if [[ -n "${DENO_ARCH}" ]] && ! command -v deno &>/dev/null \
+   && [[ ! -x "${HOME}/.local/bin/deno" ]]; then
+    echo ">>> Installing deno..."
+    DENO_TMP="$(mktemp -d)"
+    curl -fsSL -o "${DENO_TMP}/deno.zip" \
+        "https://github.com/denoland/deno/releases/latest/download/deno-${DENO_ARCH}-unknown-linux-gnu.zip"
+    unzip -q -o "${DENO_TMP}/deno.zip" -d "${DENO_TMP}"
+    install -m 755 "${DENO_TMP}/deno" "${HOME}/.local/bin/deno"
+    rm -r "${DENO_TMP}"
 fi
 
 # ── mpv config directories ───────────────────────────────────────────────────
@@ -141,6 +171,14 @@ touch "${MPV_CONF}"
 
 if ! grep -q "^osc=" "${MPV_CONF}" 2>/dev/null; then
     echo "osc=no" >> "${MPV_CONF}"
+fi
+
+# profile=fast: mpv's default lanczos scaling + dithering cost ~39 ms of GPU
+# time per 1080p frame on a Pi 5 (budget at 60 fps is 16.7 ms), dropping ~half
+# the frames. The fast profile brings it to ~6 ms. Prepended so any later
+# user settings in mpv.conf still override it.
+if ! grep -q "^profile=" "${MPV_CONF}" 2>/dev/null; then
+    { echo "profile=fast"; cat "${MPV_CONF}"; } > "${MPV_CONF}.tmp" && mv "${MPV_CONF}.tmp" "${MPV_CONF}"
 fi
 
 INCLUDE_LINE="include=~~/uosc-pi.conf"

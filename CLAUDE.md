@@ -137,3 +137,5 @@ The service targets `graphical-session.target` and sets `WAYLAND_DISPLAY=wayland
   autostart found unless run with `-m`/`--merge-config`; Pi OS does use `-m` (see
   `/usr/bin/labwc-pi`), so a user file augments the system one instead of replacing it.
 - **yt-dlp format string** — in `cast.py`, the format string prefers `mp4+m4a` for hardware-accelerated playback on Pi. If yt-dlp returns two URLs, mpv receives both via `--audio-file=` (DASH demux).
+- **Pi 5 has no H.264/AV1 hardware decode** (HEVC only), so video is software-decoded; AV1 via dav1d is actually the cheapest option. The real 1080p60 bottleneck is mpv's GPU render passes: the default lanczos scaling costs ~39 ms/frame (budget 16.7 ms). `setup.sh` prepends `profile=fast` to `mpv.conf` (~6 ms/frame). Diagnose with mpv IPC properties `frame-drop-count` and `vo-passes`.
+- **yt-dlp is installed as the standalone release binary** (bundles Python + curl_cffi) plus `deno` as its JS runtime. Don't go back to `pip install`: a distro Python upgrade orphans the module and every cast fails with "No stream URL".
