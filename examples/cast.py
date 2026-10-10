@@ -473,15 +473,16 @@ def dispatch(line: str) -> None:
     elif cmd == "set_volume":
         try:
             # Lounge API volume is 0–100; mpv volume is also 0–100.
-            mpv_ipc({"command": ["set_property", "volume", int(parts[1])]})
+            # osd-msg-bar shows mpv's volume bar so remote changes are visible.
+            mpv_ipc({"command": ["osd-msg-bar", "set", "volume", str(int(parts[1]))]})
         except (IndexError, ValueError):
             pass
 
     elif cmd == "mute":
-        mpv_ipc({"command": ["set_property", "mute", True]})
+        mpv_ipc({"command": ["osd-msg", "set", "mute", "yes"]})
 
     elif cmd == "unmute":
-        mpv_ipc({"command": ["set_property", "mute", False]})
+        mpv_ipc({"command": ["osd-msg", "set", "mute", "no"]})
 
     elif cmd == "set_subtitles":
         # "set_subtitles off"                   → disable
