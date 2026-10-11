@@ -26,9 +26,22 @@ var (
 	dialLocalIP        string
 
 	// dialStateMu guards curVideoId reads in HTTP handler goroutines against
-	// concurrent writes from the Lounge command loop in main.go.
+	// concurrent writes from the Lounge command loop in main.go. It also guards
+	// currentLoungeToken, which is replaced when the Lounge session restarts.
 	dialStateMu sync.RWMutex
 )
+
+func getLoungeToken() string {
+	dialStateMu.RLock()
+	defer dialStateMu.RUnlock()
+	return currentLoungeToken
+}
+
+func setLoungeToken(token string) {
+	dialStateMu.Lock()
+	currentLoungeToken = token
+	dialStateMu.Unlock()
+}
 
 func init() {
 	flag.IntVar(&dialHTTPPort, "p", 8008, "DIAL server HTTP port (0 to disable)")
@@ -126,6 +139,7 @@ func handleYouTubeApp(w http.ResponseWriter, r *http.Request) {
 		// (MDX_SESSION_DISCONNECT_BEHAVIOR_SCREEN_APP_STOPPED) and disconnect.
 		dialStateMu.RLock()
 		hasVideo := curVideoId != ""
+		loungeToken := currentLoungeToken
 		dialStateMu.RUnlock()
 		connectedRemotesMu.Lock()
 		hasRemote := len(connectedRemotes) > 0
@@ -148,7 +162,7 @@ func handleYouTubeApp(w http.ResponseWriter, r *http.Request) {
     <deviceId>%s</deviceId>
     <deviceName>%s</deviceName>
   </additionalData>
-</service>`, loungeAppName(), state, xmlEsc(screenId), xmlEsc(currentLoungeToken), xmlEsc(screenUid), xmlEsc(screenName))
+</service>`, loungeAppName(), state, xmlEsc(screenId), xmlEsc(loungeToken), xmlEsc(screenUid), xmlEsc(screenName))
 	case http.MethodPost:
 		// Standard DIAL uses application/x-www-form-urlencoded. The iOS YouTube
 		// app sends the same key=value body as Content-Type: text/plain, which

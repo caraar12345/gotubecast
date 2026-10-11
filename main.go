@@ -54,6 +54,10 @@ const (
 	screenUid         string = "2a026ce9-4429-4c5e-8ef5-0101eddf5671"
 	timefmt           string = "[2006-01-02 15:04:05]"
 	errCountThresh    int    = 5
+
+	// Retry delays for failed bind / session requests: doubles from min to max.
+	bindBackoffMin = 1 * time.Second
+	bindBackoffMax = 60 * time.Second
 )
 
 var (
@@ -139,68 +143,29 @@ func main() {
 		_ = os.Chmod(debugLogPath, 0600)
 	}
 	// screen id:
-	if screenId == "" {
-		resp, err := outboundHTTP.Get("https://www.youtube.com/api/lounge/pairing/generate_screen_id")
+	for attempt := 0; screenId == ""; attempt++ {
+		id, err := generateScreenId()
 		if err != nil {
-			panic(err)
+			d := bindBackoff(attempt)
+			msgPrintln(fmt.Sprintf("error generate_screen_id failed: %v (retrying in %v)", err, d))
+			time.Sleep(d)
+			continue
 		}
-		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			panic(err)
-		}
-		screenId = strings.TrimSpace(string(body))
+		screenId = id
 	}
 	msgPrintln(fmt.Sprint("screen_id ", screenId))
 
-	// lounge token:
-	resp, err := outboundHTTP.PostForm("https://www.youtube.com/api/lounge/pairing/get_lounge_token_batch", url.Values{"screen_ids": {screenId}})
-	if err != nil {
-		panic(err)
+	// lounge token + bind 1. Retried rather than fatal so a network blip at
+	// boot doesn't take the receiver down.
+	for attempt := 0; ; attempt++ {
+		err := startSession()
+		if err == nil {
+			break
+		}
+		d := bindBackoff(attempt)
+		msgPrintln(fmt.Sprintf("error session start failed: %v (retrying in %v)", err, d))
+		time.Sleep(d)
 	}
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		panic(err)
-	}
-	resp.Body.Close()
-	tokenObj := new(LoungeTokenScreenList)
-	err = json.Unmarshal(body, &tokenObj)
-	if err != nil {
-		panic(err)
-	}
-	if len(tokenObj.Screens) == 0 {
-		panic("get_lounge_token_batch returned no screens")
-	}
-	tokenScreenItem := tokenObj.Screens[0]
-	currentLoungeToken = tokenScreenItem.LoungeToken
-	msgPrintln(fmt.Sprint("lounge_token ", tokenScreenItem.LoungeToken, " ", tokenScreenItem.Expiration/1000))
-
-	bindVals = url.Values{
-		"device": {"LOUNGE_SCREEN"},
-		"id":     {screenUid},
-		"name":   {screenName},
-		"app":    {screenApp},
-		"theme":  {screenTheme},
-		// Must be non-empty: url.Values with an empty slice omits the key entirely,
-		// and YouTube will not send cast/playlist commands to a receiver with no caps.
-		"capabilities":  {"que,mus"},
-		"mdx-version":   {"2"},
-		"loungeIdToken": {tokenScreenItem.LoungeToken},
-		"VER":           {"8"},
-		"v":             {"2"},
-		"RID":           {"1337"},
-		"AID":           {"42"},
-		"zx":            {"xxxxxxxxxxxx"},
-		"t":             {"1"},
-	}
-
-	// bind 1
-	resp, err = outboundHTTP.PostForm("https://www.youtube.com/api/lounge/bc/bind?"+bindVals.Encode(), url.Values{"count": {"0"}})
-	if err != nil {
-		panic(err)
-	}
-	defer resp.Body.Close()
-	decodeBindStream(resp.Body)
 
 	// DIAL server (device discovery + YouTube app endpoint):
 	startDIAL()
@@ -208,37 +173,34 @@ func main() {
 	// pairing code every 5 minutes:
 	go func() {
 		for {
-			resp, err = outboundHTTP.PostForm("https://www.youtube.com/api/lounge/pairing/get_pairing_code?ctx=pair", url.Values{
-				"access_type":  {"permanent"},
-				"app":          {screenApp},
-				"lounge_token": {tokenScreenItem.LoungeToken},
-				"screen_id":    {tokenScreenItem.ScreenId},
-				"screen_name":  {screenName},
-			})
+			pairCode, err := fetchPairingCode()
 			if err != nil {
-				msgPrintln(fmt.Sprint("error ", err.Error()))
+				msgPrintln(fmt.Sprint("error pairing code: ", err.Error()))
 				time.Sleep(10 * time.Second)
 				continue
 			}
-			body, err = ioutil.ReadAll(resp.Body)
-			resp.Body.Close()
-			if err != nil {
-				msgPrintln(fmt.Sprint("error ", err.Error()))
-				time.Sleep(10 * time.Second)
-				continue
-			}
-			pairCode := string(body)
 			msgPrintln(fmt.Sprintf("pairing_code %s-%s-%s-%s", pairCode[0:3], pairCode[3:6], pairCode[6:9], pairCode[9:12]))
 			time.Sleep(5 * time.Minute)
 		}
 	}()
 
-	// bind:
+	// bind: long-poll forever. Errors back off exponentially; after
+	// errCountThresh in a row (or as soon as YouTube says the session is gone)
+	// a fresh session is started in-process, so playback isn't interrupted.
 	errCount := 0
 	for {
+		if errCount > 0 {
+			time.Sleep(bindBackoff(errCount - 1))
+		}
 		if errCount >= errCountThresh {
-			msgPrintln(fmt.Sprintf("error reached %d errors, terminating...", errCount))
-			return
+			msgPrintln(fmt.Sprintf("error reached %d bind errors, starting a new session", errCount))
+			if err := startSession(); err != nil {
+				errCount++
+				msgPrintln(fmt.Sprint("error session restart failed: ", err.Error()))
+				continue
+			}
+			msgPrintln("session_restarted")
+			errCount = 0
 		}
 		atomic.AddUint64(&ofs, 1)
 		// Must clone: bindVals is a map; `bindValsGet := bindVals` aliases the same map,
@@ -251,10 +213,22 @@ func main() {
 		bindValsGet["CI"] = []string{"0"}
 		bindValsGet["TYPE"] = []string{"xmlhttp"}
 		bindValsGet["AID"] = []string{strconv.FormatInt(currentCmdIndex, 10)}
-		resp, err = outboundHTTP.Get("https://www.youtube.com/api/lounge/bc/bind?" + bindValsGet.Encode())
+		resp, err := outboundHTTP.Get("https://www.youtube.com/api/lounge/bc/bind?" + bindValsGet.Encode())
 		if err != nil {
 			errCount++
-			msgPrintln(fmt.Sprint("error ", err.Error()))
+			msgPrintln(fmt.Sprint("error bind: ", stripURL(err).Error()))
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			snippet, _ := ioutil.ReadAll(io.LimitReader(resp.Body, 200))
+			resp.Body.Close()
+			errCount++
+			msgPrintln(fmt.Sprintf("error bind HTTP %d: %s", resp.StatusCode, strings.Join(strings.Fields(string(snippet)), " ")))
+			// 400 "Unknown SID" / 404 / 410: the session is gone, retrying it is pointless.
+			switch resp.StatusCode {
+			case http.StatusBadRequest, http.StatusNotFound, http.StatusGone:
+				errCount = errCountThresh
+			}
 			continue
 		}
 		err = decodeBindStream(resp.Body)
@@ -266,6 +240,161 @@ func main() {
 		}
 		errCount = 0
 	}
+}
+
+// bindBackoff returns the retry delay after the given number of prior failures.
+func bindBackoff(failures int) time.Duration {
+	d := bindBackoffMin
+	for i := 0; i < failures && d < bindBackoffMax; i++ {
+		d *= 2
+	}
+	if d > bindBackoffMax {
+		d = bindBackoffMax
+	}
+	return d
+}
+
+// stripURL drops the request URL from an *url.Error. Bind URLs carry the
+// session ID and lounge token, which shouldn't end up in logs.
+func stripURL(err error) error {
+	if ue, ok := err.(*url.Error); ok {
+		return fmt.Errorf("%s: %w", ue.Op, ue.Err)
+	}
+	return err
+}
+
+// generateScreenId asks YouTube for a new screen ID.
+func generateScreenId() (string, error) {
+	resp, err := outboundHTTP.Get("https://www.youtube.com/api/lounge/pairing/generate_screen_id")
+	if err != nil {
+		return "", err
+	}
+	body, err := ioutil.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	id := strings.TrimSpace(string(body))
+	if id == "" {
+		return "", fmt.Errorf("empty response")
+	}
+	return id, nil
+}
+
+// fetchLoungeToken asks YouTube for a lounge token for screenId.
+func fetchLoungeToken() (item LoungeTokenScreenItem, err error) {
+	resp, err := outboundHTTP.PostForm("https://www.youtube.com/api/lounge/pairing/get_lounge_token_batch", url.Values{"screen_ids": {screenId}})
+	if err != nil {
+		return
+	}
+	body, err := ioutil.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		err = fmt.Errorf("get_lounge_token_batch: HTTP %d", resp.StatusCode)
+		return
+	}
+	tokenObj := new(LoungeTokenScreenList)
+	if err = json.Unmarshal(body, tokenObj); err != nil {
+		return
+	}
+	if len(tokenObj.Screens) == 0 {
+		err = fmt.Errorf("get_lounge_token_batch returned no screens")
+		return
+	}
+	return tokenObj.Screens[0], nil
+}
+
+// startSession fetches a lounge token and opens a new bind session (SID +
+// gsessionid), replacing any previous one. Used at startup and to recover when
+// YouTube drops the session, so the process never has to exit to rebind.
+func startSession() error {
+	item, err := fetchLoungeToken()
+	if err != nil {
+		return err
+	}
+	setLoungeToken(item.LoungeToken)
+	msgPrintln(fmt.Sprint("lounge_token ", item.LoungeToken, " ", item.Expiration/1000))
+
+	postBindMu.Lock()
+	bindVals = url.Values{
+		"device": {"LOUNGE_SCREEN"},
+		"id":     {screenUid},
+		"name":   {screenName},
+		"app":    {screenApp},
+		"theme":  {screenTheme},
+		// Must be non-empty: url.Values with an empty slice omits the key entirely,
+		// and YouTube will not send cast/playlist commands to a receiver with no caps.
+		"capabilities":  {"que,mus"},
+		"mdx-version":   {"2"},
+		"loungeIdToken": {item.LoungeToken},
+		"VER":           {"8"},
+		"v":             {"2"},
+		"RID":           {"1337"},
+		"AID":           {"42"},
+		"zx":            {"xxxxxxxxxxxx"},
+		"t":             {"1"},
+	}
+	firstBindQuery := bindVals.Encode()
+	postBindMu.Unlock()
+	// A new session numbers its commands and our posts from zero again.
+	atomic.StoreUint64(&ofs, 0)
+	currentCmdIndex = 0
+
+	// bind 1
+	resp, err := outboundHTTP.PostForm("https://www.youtube.com/api/lounge/bc/bind?"+firstBindQuery, url.Values{"count": {"0"}})
+	if err != nil {
+		return stripURL(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("bind: HTTP %d", resp.StatusCode)
+	}
+	return decodeBindStream(resp.Body)
+}
+
+// fetchPairingCode returns a fresh 12-digit TV pairing code.
+func fetchPairingCode() (string, error) {
+	resp, err := outboundHTTP.PostForm("https://www.youtube.com/api/lounge/pairing/get_pairing_code?ctx=pair", url.Values{
+		"access_type":  {"permanent"},
+		"app":          {screenApp},
+		"lounge_token": {getLoungeToken()},
+		"screen_id":    {screenId},
+		"screen_name":  {screenName},
+	})
+	if err != nil {
+		return "", err
+	}
+	body, err := ioutil.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("get_pairing_code: HTTP %d", resp.StatusCode)
+	}
+	code := strings.TrimSpace(string(body))
+	if len(code) < 12 {
+		return "", fmt.Errorf("get_pairing_code: unexpected response %q", code)
+	}
+	return code, nil
+}
+
+// safeGenericCmd runs genericCmd, logging instead of crashing if a command
+// carries an unexpected payload (genericCmd type-asserts params freely; none
+// of those assertions happen while a lock is held).
+func safeGenericCmd(index int64, cmd string, paramsList []interface{}) {
+	defer func() {
+		if r := recover(); r != nil {
+			msgPrintln(fmt.Sprintf("error command %s (idx %d) panicked: %v", cmd, index, r))
+		}
+	}()
+	genericCmd(index, cmd, paramsList)
 }
 
 // decodeBindStream takes an io.Reader (e.g. bind response body) and parses the command stream
@@ -313,7 +442,7 @@ func decodeBindStream(r io.Reader) (err error) {
 				if !ok {
 					continue
 				}
-				genericCmd(index, cmdName, cmdArray[1:])
+				safeGenericCmd(index, cmdName, cmdArray[1:])
 			}
 			// closing ]:
 			dec.Token()
@@ -1018,10 +1147,15 @@ func postBind(sc string, params map[string]string) {
 	}
 	resp, err := outboundHTTP.PostForm("https://www.youtube.com/api/lounge/bc/bind?"+bindVals.Encode(), postVals)
 	if err != nil {
-		panic(err)
+		// Best effort: a lost state update isn't worth killing the receiver over.
+		msgPrintln(fmt.Sprintf("error postBind %s: %v", sc, stripURL(err)))
+		return
 	}
 	body, readErr := ioutil.ReadAll(resp.Body)
 	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msgPrintln(fmt.Sprintf("error postBind %s: HTTP %d", sc, resp.StatusCode))
+	}
 	if traceProtocol {
 		if readErr != nil {
 			dbgPrintln(fmt.Sprintf("proto_resp sc=%s status=%d read_err=%v", sc, resp.StatusCode, readErr))

@@ -41,6 +41,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -419,6 +420,15 @@ def load_subtitle_track(video_id: str, lang: str, generation: int,
 # Command dispatcher
 # ---------------------------------------------------------------------------
 
+# gotubecast output that isn't worth logging (routine, or secret like the
+# lounge token). Anything else that dispatch() doesn't handle — "error ..."
+# lines, Go panic traces — is logged so crashes leave evidence in the journal.
+_QUIET_GTC_LINES = {
+    "screen_id", "lounge_token", "option_sid", "option_gsessionid", "noop",
+    "generic_cmd", "event", "discovery_device_id", "user_action", "skip_ad",
+    "set_autoplay_mode", "set_playback_quality", "set_audio_track",
+}
+
 def dispatch(line: str) -> None:
     global _subtitle_generation, _play_generation, _active_video_id
 
@@ -519,6 +529,9 @@ def dispatch(line: str) -> None:
         except (IndexError, ValueError):
             pass
 
+    elif cmd not in _QUIET_GTC_LINES:
+        print(f"gotubecast: {line}", flush=True)
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -552,19 +565,26 @@ def main() -> None:
 
     threading.Thread(target=_playback_observer, args=(proc,), daemon=True).start()
 
+    interrupted = False
     try:
         for line in proc.stdout:
             dispatch(line.rstrip())
     except KeyboardInterrupt:
-        pass
+        interrupted = True
     finally:
         proc.terminate()
         try:
             proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait()
         with _mpv_lock:
             _reap_mpv()
+
+    if not interrupted:
+        # gotubecast exited on its own: say so and fail, so systemd records it.
+        print(f"gotubecast exited unexpectedly (code {proc.returncode})", flush=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
