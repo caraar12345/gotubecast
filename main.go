@@ -98,15 +98,7 @@ var (
 
 	connectedRemotes   = map[string]string{} // remote id → display name
 	connectedRemotesMu sync.Mutex
-	pendingStopTimer   *time.Timer // debounces stop-on-disconnect; guarded by connectedRemotesMu
 )
-
-// remoteDisconnectGrace is how long to wait after the last remote disconnects
-// before stopping playback. The Lounge protocol emits transient
-// remoteDisconnected/remoteConnected churn during normal operation (the phone
-// briefly drops and re-establishes its bind session every few seconds), so we
-// only stop if no remote has reconnected within this window.
-const remoteDisconnectGrace = 8 * time.Second
 
 // YouTube watch HTML embeds duration in player response JSON.
 var (
@@ -589,34 +581,17 @@ func genericCmd(index int64, cmd string, paramsList []interface{}) {
 		name := data["name"].(string)
 		connectedRemotesMu.Lock()
 		connectedRemotes[id] = name
-		// A remote (re)connected: cancel any pending stop from a transient drop.
-		if pendingStopTimer != nil {
-			pendingStopTimer.Stop()
-			pendingStopTimer = nil
-		}
 		connectedRemotesMu.Unlock()
 		msgPrintln(fmt.Sprint("remote_join ", id, " ", name))
 	case "remoteDisconnected":
 		data := paramsList[0].(map[string]interface{})
 		id := data["id"].(string)
 		connectedRemotesMu.Lock()
+		// Don't stop playback here: the YouTube app now drops its Lounge
+		// connection whenever it isn't actively controlling the screen, so a
+		// remote leaving says nothing about whether the user is still watching.
+		// Like a real TV, keep playing until stopVideo or the video ends.
 		delete(connectedRemotes, id)
-		// Debounce: only stop if no remote reconnects within the grace window.
-		// remoteDisconnected fires transiently during normal Lounge operation.
-		if len(connectedRemotes) == 0 {
-			if pendingStopTimer != nil {
-				pendingStopTimer.Stop()
-			}
-			pendingStopTimer = time.AfterFunc(remoteDisconnectGrace, func() {
-				connectedRemotesMu.Lock()
-				stillEmpty := len(connectedRemotes) == 0
-				pendingStopTimer = nil
-				connectedRemotesMu.Unlock()
-				if stillEmpty {
-					stopCurrentVideo()
-				}
-			})
-		}
 		connectedRemotesMu.Unlock()
 		msgPrintln(fmt.Sprint("remote_leave ", id))
 	case "getNowPlaying":
